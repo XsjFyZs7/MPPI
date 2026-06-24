@@ -60,6 +60,29 @@ class WorkspaceFilterConfig:
 Sphere = Tuple[float, float, float, float]
 
 
+def parse_spheres_spec(spec: Optional[str]) -> Tuple[Sphere, ...]:
+    if spec is None:
+        return ()
+    s = str(spec).strip()
+    if not s:
+        return ()
+
+    out: list[Sphere] = []
+    for chunk in s.split(";"):
+        c = chunk.strip()
+        if not c:
+            continue
+        parts = [p.strip() for p in c.split(",") if p.strip()]
+        if len(parts) != 4:
+            raise ValueError("ee_filter_spheres must be 'x,y,z,r; x,y,z,r; ...'")
+        x, y, z, r = (float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
+        if r <= 0.0:
+            raise ValueError("ee_filter_spheres radius must be > 0")
+        out.append((x, y, z, r))
+
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class RobotFilterConfig:
     robot_mask_margin_m: float = 0.0

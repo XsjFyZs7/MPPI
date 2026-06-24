@@ -308,74 +308,15 @@ class OnlineSceneFlowBuilder:
     def _ensure_urdf_helper(self) -> None:
         if self._urdf_helper is not None:
             return
-
-        import importlib
-
-        last_err = None
-        for mod_name in (
-            "mppi.pointworld_ext.urdf_helper",
-            "mppi.pointworld_ext.urdf",
-        ):
-            try:
-                mod = importlib.import_module(mod_name)
-            except Exception as e:  # pragma: no cover
-                last_err = e
-                continue
-
-            for cls_name in (
-                "URDFKinematicsHelper",
-                "URDFHelper",
-                "UrdfKinematicsHelper",
-                "UrdfHelper",
-            ):
-                if hasattr(mod, cls_name):
-                    cls = getattr(mod, cls_name)
-                    if hasattr(cls, "from_config"):
-                        self._urdf_helper = cls.from_config(self.cfg)
-                        return
-                    try:
-                        self._urdf_helper = cls(cfg=self.cfg)
-                        return
-                    except TypeError:
-                        self._urdf_helper = cls(self.cfg)
-                        return
-
-        raise ImportError("Could not import a URDF helper for link-anchored EE filtering") from last_err
+        if not self.cfg.urdf_path:
+            raise ValueError("cfg.urdf_path is required for URDF-based robot mask / ee filter")
+        self._urdf_helper = _URDFHelper(urdf_path=str(self.cfg.urdf_path))
 
     def _ensure_robot_mask_builder(self) -> None:
         if self._robot_mask_builder is not None:
             return
-
-        import importlib
-
-        last_err = None
-        for mod_name in (
-            "mppi.pointworld_ext.robot_mask_builder",
-            "mppi.pointworld_ext.robot_mask",
-        ):
-            try:
-                mod = importlib.import_module(mod_name)
-            except Exception as e:  # pragma: no cover
-                last_err = e
-                continue
-
-            for cls_name in (
-                "RobotMaskBuilder",
-                "RobotMask",
-            ):
-                if hasattr(mod, cls_name):
-                    cls = getattr(mod, cls_name)
-                    if hasattr(cls, "from_config"):
-                        self._robot_mask_builder = cls.from_config(self.cfg)
-                        return
-                    try:
-                        self._robot_mask_builder = cls(cfg=self.cfg)
-                        return
-                    except TypeError:
-                        self._robot_mask_builder = cls(self.cfg)
-                        return
-
-        raise ImportError("Could not import a RobotMaskBuilder for 2D seed gating") from last_err
+        self._ensure_urdf_helper()
+        self._robot_mask_builder = _RobotMask2DBuilder(urdf_helper=self._urdf_helper)
 
     def build(
         self,
@@ -435,9 +376,9 @@ class OnlineSceneFlowBuilder:
                     world2cam=world2cam0,
                     height=H0,
                     width=W0,
-                    joint_positions=getattr(steps[0], "joint_positions", None),
-                    gripper_positions=getattr(steps[0], "gripper_positions", None),
-                    seed=getattr(self.cfg, "robot_mask_seed", 0),
+                    joint_positions=np.asarray(steps[0].joint_positions, dtype=np.float32),
+                    gripper_positions=np.asarray(steps[0].gripper_positions, dtype=np.float32),
+                    seed=(int(self.cfg.robot_mask_seed) if getattr(self.cfg, "robot_mask_seed", None) is not None else None),
                 )
             else:
                 robot_mask0 = np.zeros((H0, W0), dtype=bool)
@@ -505,8 +446,8 @@ class OnlineSceneFlowBuilder:
                         raise ValueError("ee_filter_enabled is True but cfg.robot_filter.ee_filter_link is empty")
 
                     spheres_w = self._urdf_helper.transform_spheres_from_link(
-                        joint_positions=getattr(steps[t], "joint_positions", None),
-                        gripper_positions=getattr(steps[t], "gripper_positions", None),
+                        joint_positions=np.asarray(steps[t].joint_positions, dtype=np.float32),
+                        gripper_positions=np.asarray(steps[t].gripper_positions, dtype=np.float32),
                         link_name=link_name,
                         spheres_link=ee_spheres_link,
                     )
@@ -588,9 +529,9 @@ class OnlineSceneFlowBuilder:
                     world2cam=world2cams,
                     height=Hs,
                     width=Ws,
-                    joint_positions=getattr(steps[shift], "joint_positions", None),
-                    gripper_positions=getattr(steps[shift], "gripper_positions", None),
-                    seed=getattr(self.cfg, "robot_mask_seed", 0),
+                    joint_positions=np.asarray(steps[shift].joint_positions, dtype=np.float32),
+                    gripper_positions=np.asarray(steps[shift].gripper_positions, dtype=np.float32),
+                    seed=(int(self.cfg.robot_mask_seed) if getattr(self.cfg, "robot_mask_seed", None) is not None else None),
                 )
             else:
                 robot_masks = np.zeros((Hs, Ws), dtype=bool)

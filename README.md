@@ -50,6 +50,9 @@ bash /home/wangyuhan/MPPI/scripts/test_cuRobo_pcl.sh
 ```bash
 python3 -m mppi.comm.ws_server_async_pcl --host 0.0.0.0 --port 9011 --open-loop-horizon 8 --policy mppi_joint --cam-id back
 ```
+注：如果启用 PointWorld（在线 window + tracking + pointworld_cost_fn 插槽），PointWorld 强制要求 `open-loop-horizon=11`，否则 server 会拒绝启动。
+
+注：PCL server 的 `timing_policy` 会附带 `pw{0/1}:{reason}:{ms}`（例如 `pw1:ok:3.2ms` / `pw0:missing_inputs:0.0ms`）用于观察 PointWorld cost 插槽是否启用与是否降级。
 
 ### 1.5 PCL client（发送 RGB+Depth）
 - 单次请求（本地文件 rgb/depth）：
@@ -238,11 +241,11 @@ python3 /home/wangyuhan/MPPI/scripts/playback_client_pcl.py --url ws://127.0.0.1
 
 ---
 
-## 5. 关键环境变量（跑 PCL/curobo 时必看）
+## 5. 关键环境变量（跑 PCL/curobo/PointWorld 时必看）
 
-以下变量在 `ws_server_async.py::_get_joint_solver` 与 `scripts/test_cuRobo*.sh` 中使用，影响推理与场景构建：
+以下变量在 `ws_server_async.py::_get_joint_solver`、`ws_server_async_pcl.py` 与 `scripts/test_cuRobo*.sh` 中使用，影响推理与场景构建。
 
-- cuRobo 开关与权重：
+- cuRobo 开关与权重（通路 B：安全层）：
   - `MPPI_USE_CUROBO_COLLISION=1`
   - `MPPI_W_SCENE_COLLISION=...`
   - `MPPI_W_SELF_COLLISION=...`
@@ -251,7 +254,7 @@ python3 /home/wangyuhan/MPPI/scripts/playback_client_pcl.py --url ws://127.0.0.1
   - `MPPI_URDF_PATH=...`
   - `MPPI_EE_LINK=...`
 
-- 场景（点云 -> cuboids）：
+- 场景（点云 -> cuboids，通路 B）：
   - `MPPI_SCENE_FROM_PCD_BACK_CAM=1`
   - `MPPI_T_BASE_CAM_BACK_PATH=/home/wangyuhan/MPPI/configs/T_base_cam.yaml`
   - `MPPI_SCENE_ROI_MIN='x,y,z'` / `MPPI_SCENE_ROI_MAX='x,y,z'`
@@ -259,12 +262,42 @@ python3 /home/wangyuhan/MPPI/scripts/playback_client_pcl.py --url ws://127.0.0.1
   - `MPPI_SCENE_MIN_CLUSTER_VOXELS=...`
   - table/wall 过滤相关：`MPPI_SCENE_REMOVE_TABLE_POINTS`、`MPPI_SCENE_REMOVE_WALL_POINTS` 等
 
-- PCL server（RGBD -> 点云）：
+- PCL server（RGBD -> 点云，通路 B 的输入）：
   - `MPPI_PCL_CAM_INFO_BACK_PATH=/home/wangyuhan/MPPI/configs/back_cam_info.yaml`
   - `MPPI_PCL_T_BASE_CAM_BACK_PATH=/home/wangyuhan/MPPI/configs/T_base_cam.yaml`
   - `MPPI_PCL_DEPTH_UNIT_SCALE=1.0`
   - `MPPI_PCL_DEPTH_MIN_M` / `MPPI_PCL_DEPTH_MAX_M` / `MPPI_PCL_STRIDE`
   - 保存调试：`MPPI_PCL_SAVE_PCD=1`，`MPPI_PCL_SAVE_PCD_OUT=...`
+
+- PointWorld 在线输入链路（通路 A，参数对齐 PWM_Data）：
+  - 基础开关：
+    - `MPPI_PW_ENABLE=1`
+    - `MPPI_PW_COTRACKER_CKPT=/path/to/scaled_online.pth`
+    - `MPPI_PW_COTRACKER_DEVICE=cuda`
+    - `MPPI_PW_URDF_PATH=...`（默认回退到 `MPPI_URDF_PATH`）
+  - 窗口与 tracking：
+    - `open-loop-horizon=11`（PointWorld 硬性要求）
+    - `MPPI_PW_MAX_QUERY_POINTS_PER_CAMERA=2048`
+    - `MPPI_PW_MIN_TRACK_CONFIDENCE=0.0`
+    - `MPPI_PW_QUERY_RNG_SEED=0`
+  - workspace（对应 PWM_Data 的 workspace bounds 语义）：
+    - `MPPI_PW_WORKSPACE_MIN='x,y,z'`
+    - `MPPI_PW_WORKSPACE_MAX='x,y,z'`
+  - seed robot mask（对应 PWM_Data 的 robot_mask_seed/2D gating）：
+    - `MPPI_PW_SEED_ROBOT_MASK_ENABLED=1`
+    - `MPPI_PW_ROBOT_MASK_SEED=0`
+    - `MPPI_PW_ROBOT_MASK_MARGIN_M=0.02`
+  - ee filter（link-anchored，对齐 PWM_Data 的 ee_filter_*）：
+    - `MPPI_PW_EE_FILTER_ENABLED=1`
+    - `MPPI_PW_EE_FILTER_LINK=panda_link7`
+    - `MPPI_PW_EE_FILTER_SPHERES='x,y,z,r; x,y,z,r; ...'`（坐标在 link frame 下）
+    - `MPPI_PW_EE_FILTER_MARGIN_M=0.0`
+
+- PointWorld cost 插槽（通路 A → MPPI cost 汇合点，当前可先用 stub 验证链路）：
+  - `MPPI_USE_POINTWORLD_COST=1`
+  - `MPPI_W_POINTWORLD=...`
+  - `MPPI_POINTWORLD_COST_TIMEOUT_MS=...`
+  - `MPPI_POINTWORLD_REQUIRE_HORIZON_11=1`
 
 ---
 

@@ -8,11 +8,12 @@ import time
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
 from mppi.comm.ws_server_async import _get_joint_solver
+from mppi.mpc.solver import PointWorldCostFn
 from mppi.curobo_ext.check_depth_pcl import (
     load_T_row_major_4x4_yaml,
     load_intrinsics_from_cam_info_yaml,
@@ -30,6 +31,32 @@ from mppi.protocol.types_pcl import (
     SCHEMA_VERSION_PCL,
     ServerTimingPCL,
 )
+from mppi.pointworld_ext.geometry import PinholeIntrinsics as PWPinholeIntrinsics
+from mppi.pointworld_ext.input_config import (
+    PointWorldInputConfig,
+    RobotFilterConfig,
+    TrackingConfig,
+    WorkspaceFilterConfig,
+    parse_spheres_spec,
+)
+from mppi.pointworld_ext.query_manager import QueryPointManager, QueryPointManagerConfig
+from mppi.pointworld_ext.scene_flow_builder import OnlineSceneFlowBuilder
+from mppi.pointworld_ext.tracker_interface import CoTrackerOnlinePointTracker
+from mppi.pointworld_ext.window_buffer import CameraFrame as PWCameraFrame
+from mppi.pointworld_ext.window_buffer import PointWorldWindowBuffer
+
+
+def _pointworld_cost_stub(
+    *,
+    q_traj: np.ndarray,
+    u_traj: np.ndarray,
+    pointworld_obs: Dict[str, Any],
+    gripper: Optional[float],
+) -> np.ndarray:
+    q = np.asarray(q_traj)
+    if q.ndim != 3:
+        raise ValueError(f"Expected q_traj shape (K,T,7), got {q.shape}")
+    return np.zeros((int(q.shape[0]),), dtype=np.float32)
 
 
 def _require_websockets():
@@ -60,6 +87,14 @@ def _env_f(name: str, default: str) -> float:
 
 def _env_i(name: str, default: str) -> int:
     return int(os.getenv(name, default))
+
+
+def _env_vec3(name: str, default: str) -> Tuple[float, float, float]:
+    s = os.getenv(name, default).strip()
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    if len(parts) != 3:
+        raise ValueError(f"{name} must be 'x,y,z'")
+    return (float(parts[0]), float(parts[1]), float(parts[2]))
 
 
 def _decode_rgb(*, codec: Optional[str], data: Any) -> np.ndarray:
@@ -337,7 +372,161 @@ def _load_cam_configs_from_env(default_cam_id: str) -> dict[str, tuple[Any, np.n
     return out
 
 
-async def _handle_connection(ws: Any, cfg: ServerConfig, cam_configs: dict[str, tuple[Any, np.ndarray]]) -> None:
+@dataclass
+class _PointWorldRuntime:
+    cfg: PointWorldInputConfig
+    window: PointWorldWindowBuffer
+    builder: OnlineSceneFlowBuilder
+    query_manager: QueryPointManager
+
+    enabled: bool = True
+    last_pointworld_obs: Optional[Dict[str, Any]] = None
+    last_cam_id: str = ""
+    last_hw: Tuple[int, int] = (0, 0)
+    last_step_id: int = -1
+    last_ts_s: float = float("nan")
+
+    def reset(self) -> None:
+        self.window.reset()
+        self.query_manager.reset()
+        self.last_pointworld_obs = None
+
+    def push_and_maybe_build(
+        self,
+        *,
+        cam_id: str,
+        step_id: int,
+        ts_s: float,
+        rgb: np.ndarray,
+        depth: np.ndarray,
+        intr: Any,
+        T_base_cam: np.ndarray,
+        q: np.ndarray,
+        gripper: float,
+    ) -> Optional[Dict[str, Any]]:
+        cid = str(cam_id)
+        H, W = int(depth.shape[0]), int(depth.shape[1])
+
+        if self.last_cam_id and cid != self.last_cam_id:
+            self.reset()
+        if self.last_hw != (0, 0) and (H, W) != self.last_hw:
+            self.reset()
+        if self.last_step_id >= 0 and int(step_id) <= int(self.last_step_id):
+            self.reset()
+        if np.isfinite(self.last_ts_s) and float(ts_s) <= float(self.last_ts_s):
+            self.reset()
+
+        self.last_cam_id = cid
+        self.last_hw = (H, W)
+        self.last_step_id = int(step_id)
+        self.last_ts_s = float(ts_s)
+
+        intr_pw = PWPinholeIntrinsics(fx=float(intr.fx), fy=float(intr.fy), cx=float(intr.cx), cy=float(intr.cy))
+        frame = PWCameraFrame(
+            rgb=np.asarray(rgb),
+            depth=np.asarray(depth),
+            intrinsics=intr_pw,
+            extrinsics=np.asarray(T_base_cam, dtype=np.float32).reshape(4, 4),
+        )
+
+        q7 = np.asarray(q, dtype=np.float32).reshape(-1)
+        if q7.shape[0] < 7:
+            raise ValueError("q must have at least 7 elements")
+        q7 = q7[:7]
+
+        self.window.push_frame(
+            cameras={cid: frame},
+            joint_positions=q7,
+            gripper_positions=np.asarray([float(gripper)], dtype=np.float32),
+            timestamp=float(ts_s),
+        )
+
+        if not self.window.is_ready():
+            return None
+
+        scene = self.builder.build(window_shift=1, robot_spheres_base=None)
+        steps = self.window.get_window()
+        ts = np.asarray([float(s.timestamp) for s in steps], dtype=np.float64)
+        q_win = np.stack([np.asarray(s.joint_positions, dtype=np.float32).reshape(-1)[:7] for s in steps], axis=0)
+        g_win = np.asarray([float(np.asarray(s.gripper_positions).reshape(-1)[0]) for s in steps], dtype=np.float32)
+
+        obs: Dict[str, Any] = {
+            "scene_flows": np.asarray(scene.scene_flows, dtype=np.float32),
+            "scene_exists": np.asarray(scene.scene_exists, dtype=bool),
+            "scene_track_confidence": np.asarray(scene.scene_track_confidence, dtype=np.float32),
+            "scene_colors": np.asarray(scene.scene_colors, dtype=np.uint8),
+            "cameras_used": np.asarray(list(scene.cameras_used)),
+            "camera_track_slices": np.asarray(scene.camera_track_slices, dtype=np.int32),
+            "camera_track_ids": np.asarray(scene.camera_track_ids, dtype=np.int32),
+            "timestamps": ts,
+            "joint_positions_window": q_win,
+            "gripper_positions_window": g_win,
+        }
+        self.last_pointworld_obs = obs
+        return obs
+
+
+def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
+    if not _env_bool("MPPI_PW_ENABLE", "0"):
+        return None
+
+    ckpt = os.getenv("MPPI_PW_COTRACKER_CKPT", "").strip()
+    if not ckpt:
+        raise ValueError("MPPI_PW_COTRACKER_CKPT is required when MPPI_PW_ENABLE=1")
+
+    device = os.getenv("MPPI_PW_COTRACKER_DEVICE", "cuda").strip() or None
+
+    max_q = _env_i("MPPI_PW_MAX_QUERY_POINTS_PER_CAMERA", "2048")
+    min_conf = float(_env_f("MPPI_PW_MIN_TRACK_CONFIDENCE", "0.0"))
+    rng_seed = _env_i("MPPI_PW_QUERY_RNG_SEED", "0")
+
+    ws_min = _env_vec3("MPPI_PW_WORKSPACE_MIN", "-0.1,-0.7,-0.05")
+    ws_max = _env_vec3("MPPI_PW_WORKSPACE_MAX", "1.2,0.7,1.2")
+
+    seed_robot_mask_enabled = _env_bool("MPPI_PW_SEED_ROBOT_MASK_ENABLED", "0")
+    robot_mask_seed = int(os.getenv("MPPI_PW_ROBOT_MASK_SEED", "0"))
+
+    ee_filter_enabled = _env_bool("MPPI_PW_EE_FILTER_ENABLED", "0")
+    ee_filter_link = os.getenv("MPPI_PW_EE_FILTER_LINK", "panda_link7")
+    ee_filter_spheres = parse_spheres_spec(os.getenv("MPPI_PW_EE_FILTER_SPHERES", ""))
+
+    urdf_path = os.getenv("MPPI_PW_URDF_PATH", os.getenv("MPPI_URDF_PATH", "")).strip() or None
+
+    tracking = TrackingConfig(max_query_points_per_camera=int(max_q), min_track_confidence=float(min_conf))
+    workspace = WorkspaceFilterConfig(workspace_min=ws_min, workspace_max=ws_max)
+    robot = RobotFilterConfig(
+        robot_mask_margin_m=float(os.getenv("MPPI_PW_ROBOT_MASK_MARGIN_M", "0.02")),
+        ee_filter_enabled=bool(ee_filter_enabled),
+        ee_filter_link=str(ee_filter_link),
+        ee_filter_spheres=tuple(ee_filter_spheres),
+        ee_filter_margin_m=float(os.getenv("MPPI_PW_EE_FILTER_MARGIN_M", "0.0")),
+    )
+
+    cfg = PointWorldInputConfig(
+        window_size=11,
+        tracking=tracking,
+        workspace_filter=workspace,
+        robot_filter=robot,
+        urdf_path=urdf_path,
+        seed_robot_mask_enabled=bool(seed_robot_mask_enabled),
+        robot_mask_seed=int(robot_mask_seed),
+        camera_selection="all_available",
+        min_cameras=1,
+    )
+
+    window = PointWorldWindowBuffer(window_size=11)
+    query_manager = QueryPointManager(cfg=QueryPointManagerConfig(max_query_points_per_camera=int(max_q), min_track_confidence=float(min_conf), rng_seed=int(rng_seed)))
+    tracker = CoTrackerOnlinePointTracker(checkpoint=str(ckpt), window_len=11, device=device)
+    builder = OnlineSceneFlowBuilder(cfg=cfg, window_buffer=window, tracker=tracker, query_manager=query_manager)
+    return _PointWorldRuntime(cfg=cfg, window=window, builder=builder, query_manager=query_manager)
+
+
+async def _handle_connection(
+    ws: Any,
+    cfg: ServerConfig,
+    cam_configs: dict[str, tuple[Any, np.ndarray]],
+    pw: Optional[_PointWorldRuntime],
+) -> None:
     while True:
         try:
             data = await asyncio.wait_for(ws.recv(), timeout=cfg.request_timeout_s)
@@ -388,6 +577,23 @@ async def _handle_connection(ws: Any, cfg: ServerConfig, cam_configs: dict[str, 
             else:
                 raise ValueError("Missing depth payload: provide depth_bytes or depth_back")
 
+            if pw is not None and bool(pw.enabled):
+                ts_s = float(obs.t_client_send_ns) * 1e-9
+                try:
+                    pw.push_and_maybe_build(
+                        cam_id=str(obs.cam_id) if obs.cam_id is not None else str(cfg.cam_id),
+                        step_id=int(obs.step_id),
+                        ts_s=float(ts_s),
+                        rgb=np.asarray(rgb),
+                        depth=np.asarray(depth),
+                        intr=intr,
+                        T_base_cam=T_base_cam,
+                        q=np.asarray(obs.q, dtype=np.float32),
+                        gripper=float(obs.gripper),
+                    )
+                except Exception:
+                    pw.reset()
+
             pcd_base = rgbd_to_pointcloud_base(
                 depth=np.asarray(depth),
                 rgb=np.asarray(rgb),
@@ -407,10 +613,14 @@ async def _handle_connection(ws: Any, cfg: ServerConfig, cam_configs: dict[str, 
                 actions = _make_actions_dummy_hold(obs.q, float(obs.gripper), cfg.open_loop_horizon)
             elif cfg.policy == "mppi_joint":
                 solver = _get_joint_solver(cfg.open_loop_horizon)
+                pw_obs = pw.last_pointworld_obs if (pw is not None and bool(pw.enabled)) else None
+                pw_cost_fn: Optional[PointWorldCostFn] = _pointworld_cost_stub if (pw is not None and bool(pw.enabled)) else None
                 actions = solver.infer_actions(
                     q0=obs.q,
                     gripper=float(obs.gripper),
                     pcd_back_cam=pcd_base,
+                    pointworld_obs=pw_obs,
+                    pointworld_cost_fn=pw_cost_fn,
                 )
 
                 if _env_bool("MPPI_PCL_SAVE_PCD", "0") and getattr(solver, "cfg", None) is not None:
@@ -498,7 +708,13 @@ async def _handle_connection(ws: Any, cfg: ServerConfig, cam_configs: dict[str, 
 
                 stable_trk = int(getattr(solver, "last_scene_num_dynamic_tracks", 0) or 0)
                 scene_key_short = str(getattr(solver, "last_scene_key_short", "") or "")
-                timing_policy = f"mppi_joint+{'curobo' if use_curobo else 'nocurobo'}+ess{ess_ratio:.3f}+tab{1 if has_table else 0}+cub{n_cub}+trk{int(stable_trk)}+key{scene_key_short}+sph{n_sph}"
+
+                pw_enabled = bool(getattr(solver, "last_pw_enabled", False))
+                pw_reason = str(getattr(solver, "last_pw_reason", "") or "")
+                pw_ms = float(getattr(solver, "last_pw_ms", 0.0) or 0.0)
+                pw_tag = f"pw{1 if pw_enabled else 0}:{pw_reason}:{pw_ms:.1f}ms"
+
+                timing_policy = f"mppi_joint+{'curobo' if use_curobo else 'nocurobo'}+ess{ess_ratio:.3f}+tab{1 if has_table else 0}+cub{n_cub}+trk{int(stable_trk)}+key{scene_key_short}+sph{n_sph}+{pw_tag}"
 
                 suffix = str(getattr(solver, "last_timing_policy_suffix", "") or "")
                 if suffix:
@@ -542,6 +758,7 @@ async def _handle_connection(ws: Any, cfg: ServerConfig, cam_configs: dict[str, 
 async def serve(cfg: ServerConfig) -> None:
     websockets = _require_websockets()
     cam_configs = _load_cam_configs_from_env(cfg.cam_id)
+    pw = _build_pointworld_runtime()
 
     if cfg.cam_id not in cam_configs:
         raise RuntimeError(
@@ -550,7 +767,7 @@ async def serve(cfg: ServerConfig) -> None:
         )
 
     async def handler(ws: Any) -> None:
-        await _handle_connection(ws, cfg, cam_configs)
+        await _handle_connection(ws, cfg, cam_configs, pw)
 
     async with websockets.serve(handler, cfg.host, cfg.port, max_size=None):
         await asyncio.Future()

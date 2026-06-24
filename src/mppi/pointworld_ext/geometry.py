@@ -237,47 +237,6 @@ def apply_ee_filter_to_points(
     return apply_robot_sphere_mask_to_points(pts, spheres=ee_filter_spheres, margin=float(ee_filter_margin_m))
 
 
-def invert_T(T: np.ndarray) -> np.ndarray:
-    Tm = np.asarray(T, dtype=np.float32).reshape(4, 4)
-    R = Tm[:3, :3]
-    t = Tm[:3, 3]
-    Rt = R.T
-    out = np.eye(4, dtype=np.float32)
-    out[:3, :3] = Rt
-    out[:3, 3] = (-Rt @ t).astype(np.float32)
-    return out
-
-
-def project_points_to_pixels(
-    pts_world: np.ndarray,
-    *,
-    world2cam: np.ndarray,
-    intr: PinholeIntrinsics,
-) -> Tuple[np.ndarray, np.ndarray]:
-    p = np.asarray(pts_world, dtype=np.float32)
-    if p.ndim != 2 or p.shape[1] != 3:
-        raise ValueError(f"Expected pts_world shape (N,3), got {p.shape}")
-
-    Tcw = np.asarray(world2cam, dtype=np.float32).reshape(4, 4)
-    ones = np.ones((p.shape[0], 1), dtype=np.float32)
-    ph = np.concatenate([p, ones], axis=1)
-    pc = (ph @ Tcw.T)[:, :3]
-
-    z = pc[:, 2]
-    ok = np.isfinite(z) & (z > 1e-6)
-
-    fx = float(intr.fx)
-    fy = float(intr.fy)
-    cx = float(intr.cx)
-    cy = float(intr.cy)
-
-    u = np.zeros((p.shape[0],), dtype=np.float32)
-    v = np.zeros((p.shape[0],), dtype=np.float32)
-    u[ok] = (pc[ok, 0] / z[ok]) * fx + cx
-    v[ok] = (pc[ok, 1] / z[ok]) * fy + cy
-    uv = np.stack([u, v], axis=1).astype(np.float32)
-    return uv, ok.astype(bool)
-
 
 def compute_workspace_mask_2d(
     *,
@@ -395,54 +354,3 @@ def project_points_to_pixels(
     v[ok] = (pc[ok, 1] / z[ok]) * fy + cy
     uv = np.stack([u, v], axis=1).astype(np.float32)
     return uv, ok.astype(bool)
-
-
-def compute_workspace_mask_2d(
-    *,
-    height: int,
-    width: int,
-    intr: PinholeIntrinsics,
-    world2cam: np.ndarray,
-    workspace_min: Tuple[float, float, float],
-    workspace_max: Tuple[float, float, float],
-) -> np.ndarray:
-    H = int(height)
-    W = int(width)
-    if H <= 0 or W <= 0:
-        raise ValueError("height/width must be positive")
-
-    try:
-        import cv2
-    except Exception as e:  # noqa: BLE001
-        raise RuntimeError("Missing dependency: cv2 (opencv-python) is required for workspace 2D mask") from e
-
-    mn = np.asarray(workspace_min, dtype=np.float32).reshape(3)
-    mx = np.asarray(workspace_max, dtype=np.float32).reshape(3)
-
-    corners = np.asarray(
-        [
-            [mn[0], mn[1], mn[2]],
-            [mn[0], mn[1], mx[2]],
-            [mn[0], mx[1], mn[2]],
-            [mn[0], mx[1], mx[2]],
-            [mx[0], mn[1], mn[2]],
-            [mx[0], mn[1], mx[2]],
-            [mx[0], mx[1], mn[2]],
-            [mx[0], mx[1], mx[2]],
-        ],
-        dtype=np.float32,
-    )
-
-    uv, okz = project_points_to_pixels(corners, world2cam=world2cam, intr=intr)
-    uv = uv[okz]
-    if uv.shape[0] < 3:
-        return np.ones((H, W), dtype=bool)
-
-    pts = np.round(uv).astype(np.int32)
-    pts[:, 0] = np.clip(pts[:, 0], 0, W - 1)
-    pts[:, 1] = np.clip(pts[:, 1], 0, H - 1)
-
-    hull = cv2.convexHull(pts.reshape(-1, 1, 2))
-    mask = np.zeros((H, W), dtype=np.uint8)
-    cv2.fillConvexPoly(mask, hull, 1)
-    return mask.astype(bool)
