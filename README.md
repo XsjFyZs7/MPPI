@@ -2,8 +2,12 @@
 
 本仓库提供一个面向 Franka 机械臂的 MPPI（Model Predictive Path Integral）关节空间推理服务，并带两套通信与场景输入链路：
 
-- V1 链路：客户端直接发送（可选）点云 `pcd_back_cam`；服务器返回开环关节轨迹动作。
-- PCL 链路：客户端发送 RGB+Depth（可压缩）；服务器在线反投影生成点云、构建碰撞场景（cuboids）并可用 cuRobo 做 GPU 碰撞距离/代价。
+- V1 链路（schema_version=1，端口 9010）：客户端直接发送（可选）点云 `pcd_back_cam`；服务器直接消费点云并返回开环关节轨迹动作。
+  - 适用：纯通信/MPPI 基线调试、离线点云回放（npz/ply 转换后）。
+  - 不适用：PointWorld 在线接入（因为不传 RGB/Depth/相机参数，后续很难补齐在线 tracking 所需数据）。
+- PCL 链路（schema_version=100，端口 9011）：客户端发送 RGB+Depth（可压缩）+ cam_id（可选携带 intrinsics/T_base_cam）；服务器端在线解码并反投影生成 base 坐标点云，再构建碰撞场景（cuboids）并可用 cuRobo 做 GPU 碰撞距离/代价。
+  - 强烈建议：接入 PointWorld/在线 scene_flows 输入链路时优先基于 PCL 版本扩展（`src/mppi/comm/ws_server_async_pcl.py` / `src/mppi/comm/ws_client_sync_pcl.py`）。
+  - 原因：PointWorld 在线链路需要连续的 RGB-D 窗口、相机内外参以及逐帧同步的机器人状态，PCL 协议天然携带这些信息；而 V1 只传点云会丢失 2D tracking 所需的图像时序语义。
 
 本 README 的目标是让同事能快速定位需要修改/测试的代码：通信功能检测、在线点云构建、以及 cuRobo 碰撞箱/碰撞计算的 GPU 加速与验证。
 
