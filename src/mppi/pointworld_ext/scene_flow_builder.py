@@ -26,6 +26,8 @@ class SceneFlowBuildOutput:
     scene_flows: np.ndarray
     scene_colors: np.ndarray
     scene_exists: np.ndarray
+    scene_visibility: np.ndarray
+    scene_depth_valid_mask: np.ndarray
     scene_track_confidence: np.ndarray
     camera_track_slices: Tuple[Tuple[int, int], ...]
     camera_track_ids: np.ndarray
@@ -351,6 +353,8 @@ class OnlineSceneFlowBuilder:
 
         per_cam_xyz: Dict[str, np.ndarray] = {}
         per_cam_exists: Dict[str, np.ndarray] = {}
+        per_cam_visibility: Dict[str, np.ndarray] = {}
+        per_cam_depth_valid: Dict[str, np.ndarray] = {}
         per_cam_conf: Dict[str, np.ndarray] = {}
         per_cam_cols: Dict[str, np.ndarray] = {}
 
@@ -425,6 +429,8 @@ class OnlineSceneFlowBuilder:
 
             xyz_base = np.zeros((T, q0.shape[0], 3), dtype=np.float32)
             exists = np.zeros((T, q0.shape[0]), dtype=bool)
+            vis_out = np.zeros((T, q0.shape[0]), dtype=bool)
+            depth_valid_out = np.zeros((T, q0.shape[0]), dtype=bool)
             conf_out = np.zeros((T, q0.shape[0]), dtype=np.float32)
             ws_ok = np.zeros((T, q0.shape[0]), dtype=bool)
 
@@ -486,6 +492,8 @@ class OnlineSceneFlowBuilder:
                     & (confidence[t] >= float(self.cfg.tracking.min_track_confidence))
                 )
 
+                vis_out[t] = visibility[t]
+                depth_valid_out[t] = z_ok
                 xyz_base[t] = np.where(ok[:, None], xyzb, np.zeros_like(xyzb))
                 exists[t] = ok
                 conf_out[t] = np.where(ok, confidence[t], 0.0).astype(np.float32)
@@ -523,6 +531,8 @@ class OnlineSceneFlowBuilder:
 
             per_cam_xyz[cam_name] = xyz_base
             per_cam_exists[cam_name] = exists
+            per_cam_visibility[cam_name] = vis_out
+            per_cam_depth_valid[cam_name] = depth_valid_out
             per_cam_conf[cam_name] = conf_out
             per_cam_cols[cam_name] = np.repeat(cols0[None, :, :], T, axis=0)
 
@@ -597,11 +607,15 @@ class OnlineSceneFlowBuilder:
         xyz_list = [per_cam_xyz[n] for n in cameras_used]
         cols_list = [per_cam_cols[n] for n in cameras_used]
         exists_list = [per_cam_exists[n] for n in cameras_used]
+        vis_list = [per_cam_visibility[n] for n in cameras_used]
+        depth_valid_list = [per_cam_depth_valid[n] for n in cameras_used]
         conf_list = [per_cam_conf[n] for n in cameras_used]
 
         scene_flows = np.concatenate(xyz_list, axis=1).astype(np.float32)
         scene_colors = np.concatenate(cols_list, axis=1).astype(np.uint8)
         scene_exists = np.concatenate(exists_list, axis=1).astype(bool)
+        scene_visibility = np.concatenate(vis_list, axis=1).astype(bool)
+        scene_depth_valid_mask = np.concatenate(depth_valid_list, axis=1).astype(bool)
         scene_track_confidence = np.concatenate(conf_list, axis=1).astype(np.float32)
 
         camera_track_slices = []
@@ -618,6 +632,8 @@ class OnlineSceneFlowBuilder:
             scene_flows=scene_flows,
             scene_colors=scene_colors,
             scene_exists=scene_exists,
+            scene_visibility=scene_visibility,
+            scene_depth_valid_mask=scene_depth_valid_mask,
             scene_track_confidence=scene_track_confidence,
             camera_track_slices=tuple(camera_track_slices),
             camera_track_ids=camera_track_ids,

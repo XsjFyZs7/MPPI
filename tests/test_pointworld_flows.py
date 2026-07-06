@@ -46,10 +46,12 @@ def test_prepare_scene_and_robot_feature_shapes() -> None:
     assert robot["robot_features"].shape == (3, 4, 4, 16)
     assert robot["robot_exists"].shape == (3, 4, 4)
 
+    robot_flows = np.ones((3, 4, 2, 3), dtype=np.float32)
     scene_features = build_scene_features(
         scene_flows=scene["scene_flows"],
         scene_colors=scene["scene_colors"],
         gripper_positions=np.zeros((3, 4), dtype=np.float32),
+        robot_flows=robot_flows,
     )
     assert scene_features.shape == (3, 1, 6, 17)
 
@@ -62,15 +64,22 @@ def test_build_scene_features_torch_matches_numpy() -> None:
     scene_flows = rng.normal(size=(3, 4, 6, 3)).astype(np.float32)
     scene_colors = rng.normal(size=(3, 4, 6, 3)).astype(np.float32)
     gripper_positions = rng.normal(size=(3, 4)).astype(np.float32)
+    robot_flows = rng.normal(size=(3, 4, 5, 3)).astype(np.float32)
 
     expected = build_scene_features(
         scene_flows=scene_flows,
         scene_colors=scene_colors,
         gripper_positions=gripper_positions,
+        robot_flows=robot_flows,
     )
     actual = build_scene_features_torch(
         scene_flows=torch.as_tensor(scene_flows),
         scene_colors=torch.as_tensor(scene_colors),
         gripper_positions=torch.as_tensor(gripper_positions),
+        robot_flows=torch.as_tensor(robot_flows),
     )
     assert np.allclose(actual.cpu().numpy(), expected, atol=1e-6)
+
+    dist2robot = expected[..., -scene_flows.shape[1]:]
+    assert not np.allclose(dist2robot, 0.0)
+    assert float(dist2robot.max() - dist2robot.min()) > 1e-4

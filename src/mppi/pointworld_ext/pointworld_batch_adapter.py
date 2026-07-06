@@ -52,6 +52,8 @@ def build_pointworld_batch(
     scene_flows = np.asarray(scene.scene_flows, dtype=np.float32)
     scene_colors = np.asarray(scene.scene_colors, dtype=np.uint8)
     scene_exists = np.asarray(scene.scene_exists, dtype=bool)
+    scene_visibility = np.asarray(scene.scene_visibility, dtype=bool)
+    scene_depth_valid = np.asarray(scene.scene_depth_valid_mask, dtype=bool)
     scene_conf = np.asarray(scene.scene_track_confidence, dtype=np.float32)
 
     if scene_flows.ndim != 3 or scene_flows.shape[2] != 3:
@@ -60,6 +62,10 @@ def build_pointworld_batch(
         raise ValueError(f"scene_colors shape {scene_colors.shape} must match scene_flows shape {scene_flows.shape}")
     if scene_exists.shape != scene_flows.shape[:2]:
         raise ValueError(f"scene_exists shape {scene_exists.shape} must match (T,N)={scene_flows.shape[:2]}")
+    if scene_visibility.shape != scene_flows.shape[:2]:
+        raise ValueError(f"scene_visibility shape {scene_visibility.shape} must match (T,N)={scene_flows.shape[:2]}")
+    if scene_depth_valid.shape != scene_flows.shape[:2]:
+        raise ValueError(f"scene_depth_valid_mask shape {scene_depth_valid.shape} must match (T,N)={scene_flows.shape[:2]}")
     if scene_conf.shape != scene_flows.shape[:2]:
         raise ValueError(f"scene_track_confidence shape {scene_conf.shape} must match (T,N)={scene_flows.shape[:2]}")
 
@@ -89,6 +95,8 @@ def build_pointworld_batch(
         scene_flows = _pad_or_trim_TN3(scene_flows, T=T, N=Ns, dtype=np.float32)
         scene_colors = _pad_or_trim_TN3_u8(scene_colors, T=T, N=Ns)
         scene_exists = _pad_or_trim_TN(scene_exists, T=T, N=Ns, dtype=bool)
+        scene_visibility = _pad_or_trim_TN(scene_visibility, T=T, N=Ns, dtype=bool)
+        scene_depth_valid = _pad_or_trim_TN(scene_depth_valid, T=T, N=Ns, dtype=bool)
         scene_conf = _pad_or_trim_TN(scene_conf, T=T, N=Ns, dtype=np.float32)
         N_scene = Ns
 
@@ -102,6 +110,8 @@ def build_pointworld_batch(
         "scene_flows": scene_flows,
         "scene_colors": scene_colors,
         "scene_exists": scene_exists,
+        "scene_visibility": scene_visibility,
+        "scene_depth_valid_mask": scene_depth_valid,
         "robot_flows": rf,
         "robot_positions": rp,
         "gripper_positions": gp.astype(np.float32, copy=False),

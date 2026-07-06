@@ -286,50 +286,70 @@ def build_scene_features(
     scene_flows: np.ndarray,
     scene_colors: np.ndarray,
     gripper_positions: np.ndarray,
+    robot_flows: np.ndarray,
+    robot_exists: np.ndarray | None = None,
 ) -> np.ndarray:
     flows = np.asarray(scene_flows, dtype=np.float32)
     colors = np.asarray(scene_colors, dtype=np.float32)
     gripper = np.asarray(gripper_positions, dtype=np.float32)
-
+    robot = np.asarray(robot_flows, dtype=np.float32)
+    exists = (np.asarray(robot_exists, dtype=bool) if robot_exists is not None else (np.linalg.norm(robot, axis=-1) > 0.0))
     if flows.ndim != 4 or flows.shape[-1] != 3:
         raise ValueError(f"scene_flows must be (B,T,N,3), got {flows.shape}")
     if colors.shape != flows.shape:
         raise ValueError(f"scene_colors must match scene_flows shape, got {colors.shape} vs {flows.shape}")
     if gripper.shape != flows.shape[:2]:
         raise ValueError(f"gripper_positions shape {gripper.shape} must match scene_flows[:2]={flows.shape[:2]}")
-
+    if robot.shape[:2] != flows.shape[:2] or robot.shape[-1] != 3:
+        raise ValueError(f"robot_flows must be (B,T,Nr,3) with matching (B,T), got {robot.shape}")
     B, T, Ns, _ = flows.shape
+    p0 = flows[:, 0]
+    dist2robot = np.empty((B, 1, Ns, T), dtype=np.float32)
+    for t in range(T):
+        diff = p0[:, :, None, :] - robot[:, t, None, :, :]
+        d = np.linalg.norm(diff, axis=-1)
+        d = np.where(exists[:, t, None, :], d, np.inf)
+        dist2robot[:, 0, :, t] = np.min(d, axis=-1)
     normals0 = np.zeros((B, 1, Ns, 3), dtype=np.float32)
     flow0 = flows[:, :1]
     color0 = colors[:, :1]
-
     gripper_ctx = np.repeat(gripper[:, None, None, :], Ns, axis=2).astype(np.float32)
-    dist2robot = np.zeros((B, 1, Ns, T), dtype=np.float32)
-
     return np.concatenate([flow0, color0, normals0, gripper_ctx, dist2robot], axis=-1).astype(np.float32)
 
 
-def build_scene_features_torch(*, scene_flows, scene_colors, gripper_positions):
+def build_scene_features_torch(*, scene_flows, scene_colors, gripper_positions, robot_flows, robot_exists=None):
     try:
         import torch
     except Exception as e:  # noqa: BLE001
         raise RuntimeError("Missing dependency: torch") from e
-
     flows = torch.as_tensor(scene_flows, dtype=torch.float32)
     colors = torch.as_tensor(scene_colors, device=flows.device, dtype=torch.float32)
     gripper = torch.as_tensor(gripper_positions, device=flows.device, dtype=torch.float32)
-
+    robot = torch.as_tensor(robot_flows, device=flows.device, dtype=torch.float32)
+    exists = (torch.as_tensor(robot_exists, device=flows.device, dtype=torch.bool) if robot_exists is not None else (torch.linalg.norm(robot, dim=-1) > 0.0))
     if flows.ndim != 4 or int(flows.shape[-1]) != 3:
         raise ValueError(f"scene_flows must be (B,T,N,3), got {tuple(flows.shape)}")
     if tuple(colors.shape) != tuple(flows.shape):
         raise ValueError(f"scene_colors must match scene_flows shape, got {tuple(colors.shape)} vs {tuple(flows.shape)}")
     if tuple(gripper.shape) != tuple(flows.shape[:2]):
         raise ValueError(f"gripper_positions shape {tuple(gripper.shape)} must match scene_flows[:2]={tuple(flows.shape[:2])}")
-
+    if robot.ndim != 4 or tuple(robot.shape[:2]) != tuple(flows.shape[:2]) or int(robot.shape[-1]) != 3:
+        raise ValueError(f"robot_flows must be (B,T,Nr,3) with matching (B,T), got {tuple(robot.shape)}")
     B, T, Ns, _ = flows.shape
+    p0 = flows[:, 0]
+    dist2robot = torch.empty((B, 1, Ns, T), device=flows.device, dtype=torch.float32)
+    for t in range(T):
+        pts = robot[:, t]
+        valid = exists[:, t]
+        out_t = torch.empty((B, Ns), device=flows.device, dtype=torch.float32)
+        for s in range(0, Ns, 256):
+            e = min(s + 256, Ns)
+            d = torch.cdist(p0[:, s:e], pts)
+            d = d.masked_fill(~valid[:, None, :], float("inf"))
+            out_t[:, s:e] = d.min(dim=-1).values
+        dist2robot[:, 0, :, t] = out_t
     normals0 = torch.zeros((B, 1, Ns, 3), device=flows.device, dtype=torch.float32)
     flow0 = flows[:, :1]
     color0 = colors[:, :1]
     gripper_ctx = gripper[:, None, None, :].expand(B, 1, Ns, T)
-    dist2robot = torch.zeros((B, 1, Ns, T), device=flows.device, dtype=torch.float32)
     return torch.cat([flow0, color0, normals0, gripper_ctx, dist2robot], dim=-1).to(dtype=torch.float32)

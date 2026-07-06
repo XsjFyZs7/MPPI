@@ -7,7 +7,7 @@ import numpy as np
 
 @dataclass(frozen=True)
 class PointWorldCostConfig:
-    mode: str = "flow_l2"
+    mode: str = "task_point_goal_l2"
     use_model_confidence: bool = True
     use_track_confidence: bool = True
     min_confidence: float = 0.0

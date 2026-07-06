@@ -326,6 +326,16 @@ class PointWorldCostModel:
             max_scene_points=int(self.max_scene_points),
         )
 
+        if "task_point_indices_obs" in pointworld_obs and "task_goal_positions_obs" in pointworld_obs:
+            scene["task_point_indices_obs"] = np.asarray(pointworld_obs["task_point_indices_obs"], dtype=np.int64).reshape(-1)
+            scene["task_goal_positions_obs"] = np.asarray(pointworld_obs["task_goal_positions_obs"], dtype=np.float32)
+            scene["task_weight_obs"] = float(pointworld_obs.get("task_weight_obs", 1.0))
+
+        if "task_point_indices_infl" in pointworld_obs and "task_goal_positions_infl" in pointworld_obs:
+            scene["task_point_indices_infl"] = np.asarray(pointworld_obs["task_point_indices_infl"], dtype=np.int64).reshape(-1)
+            scene["task_goal_positions_infl"] = np.asarray(pointworld_obs["task_goal_positions_infl"], dtype=np.float32)
+            scene["task_weight_infl"] = float(pointworld_obs.get("task_weight_infl", 0.5))
+
         if "task_point_indices" in pointworld_obs and "task_goal_positions" in pointworld_obs:
             scene["task_point_indices"] = np.asarray(pointworld_obs["task_point_indices"], dtype=np.int64).reshape(-1)
             scene["task_goal_positions"] = np.asarray(pointworld_obs["task_goal_positions"], dtype=np.float32)
@@ -419,6 +429,8 @@ class PointWorldCostModel:
                 scene_flows=scene_flows_t,
                 scene_colors=scene_colors_t,
                 gripper_positions=robot_t["gripper_positions"],
+                robot_flows=robot_t["robot_flows"],
+                robot_exists=robot_t["robot_exists"],
             )
             batch_t = {
                 "scene_flows": scene_flows_t,
@@ -443,18 +455,45 @@ class PointWorldCostModel:
             if "scene_track_confidence" in scene_t:
                 track_conf_t = scene_t["scene_track_confidence"].expand(chunk_b, -1, -1)
 
-            costs.append(
-                reduce_pointworld_cost_torch(
-                    scene_relative=outputs["scene_relative"],
-                    scene_exists=batch_t["scene_exists"],
-                    model_confidence=model_conf,
-                    track_confidence=track_conf_t,
-                    scene_p0=scene_flows_t[:, 0],
-                    task_point_indices=scene_t.get("task_point_indices"),
-                    task_goal_positions=scene_t.get("task_goal_positions"),
-                    cfg=self.cfg.cost,
-                ).detach().cpu().numpy().astype(np.float32)
-            )
+            mode = str(self.cfg.cost.mode)
+            task_mode = mode in {"task_point_goal_l2", "final_task_point_goal_l2"}
+
+            terms = []
+            if "task_point_indices_obs" in scene_t and "task_goal_positions_obs" in scene_t:
+                terms.append((scene_t.get("task_point_indices_obs"), scene_t.get("task_goal_positions_obs"), float(scene_t.get("task_weight_obs", 1.0))))
+            if "task_point_indices_infl" in scene_t and "task_goal_positions_infl" in scene_t:
+                terms.append((scene_t.get("task_point_indices_infl"), scene_t.get("task_goal_positions_infl"), float(scene_t.get("task_weight_infl", 0.5))))
+            if "task_point_indices" in scene_t and "task_goal_positions" in scene_t:
+                terms.append((scene_t.get("task_point_indices"), scene_t.get("task_goal_positions"), 1.0))
+
+            if terms:
+                total = torch.zeros((chunk_b,), device=replica.device, dtype=torch.float32)
+                for idx_term, goal_term, w_term in terms:
+                    if float(w_term) == 0.0:
+                        continue
+                    total = total + float(w_term) * reduce_pointworld_cost_torch(
+                        scene_relative=outputs["scene_relative"],
+                        scene_exists=batch_t["scene_exists"],
+                        model_confidence=model_conf,
+                        track_confidence=track_conf_t,
+                        scene_p0=scene_flows_t[:, 0],
+                        task_point_indices=idx_term,
+                        task_goal_positions=goal_term,
+                        cfg=self.cfg.cost,
+                    )
+                costs.append(total.detach().cpu().numpy().astype(np.float32))
+            elif task_mode:
+                costs.append(torch.zeros((chunk_b,), device=replica.device, dtype=torch.float32).detach().cpu().numpy().astype(np.float32))
+            else:
+                costs.append(
+                    reduce_pointworld_cost_torch(
+                        scene_relative=outputs["scene_relative"],
+                        scene_exists=batch_t["scene_exists"],
+                        model_confidence=model_conf,
+                        track_confidence=track_conf_t,
+                        cfg=self.cfg.cost,
+                    ).detach().cpu().numpy().astype(np.float32)
+                )
 
         return np.concatenate(costs, axis=0).astype(np.float32, copy=False)
 

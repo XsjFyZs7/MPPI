@@ -1,10 +1,39 @@
-numpy
-msgpack
-websockets
-opencv-python
-pillow
-scipy
-torch
-pytorch_kinematics
-urdfpy
-trimesh
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mppi"
+version = "0.0.0"
+description = "MPPI + PointWorld integration"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "msgpack",
+  "websockets",
+  "opencv-python",
+  "pillow",
+  "scipy",
+  "torch",
+  "pytorch-kinematics",
+  "urdfpy",
+  "trimesh",
+  "pyyaml",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.optional-dependencies]
+pointworld = [
+  "torch",
+  "pytorch-kinematics",
+]
+masks = [
+  "opencv-python",
+  "urdfpy",
+  "trimesh",
+]

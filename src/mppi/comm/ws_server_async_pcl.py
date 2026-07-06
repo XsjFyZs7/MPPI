@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import io
+import json
 import os
 import time
 import zlib
@@ -86,6 +87,70 @@ def _env_vec3(name: str, default: str) -> Tuple[float, float, float]:
     if len(parts) != 3:
         raise ValueError(f"{name} must be 'x,y,z'")
     return (float(parts[0]), float(parts[1]), float(parts[2]))
+
+
+DEFAULT_PW_AABB_CONFIG_PATH = str(repo_path("configs/pointworld_static_aabbs.json"))
+DEFAULT_PW_TASK_ABLATION = "obs_infl"
+DEFAULT_PW_TASK_W_OBS = 1.0
+DEFAULT_PW_TASK_W_INFL = 0.5
+DEFAULT_PW_TASK_MIN_POINTS = 1
+DEFAULT_PW_SEED_ROBOT_MASK_ENABLED = True
+DEFAULT_PW_GRIPPER_POSE_ENABLED = True
+DEFAULT_PW_TASK_USE_VISIBILITY = True
+DEFAULT_PW_TASK_USE_DEPTH_VALID = True
+
+
+def _load_aabb_config_json(path: str) -> dict[str, Any]:
+    p = str(Path(path))
+    obj = json.load(open(p, "r", encoding="utf-8"))
+    obstacles = obj.get("obstacles", obj.get("aabbs", []))
+    if not isinstance(obstacles, list):
+        raise ValueError("AABB config must contain a list 'obstacles'")
+
+    mins: list[np.ndarray] = []
+    maxs: list[np.ndarray] = []
+    infls: list[float] = []
+
+    for it in obstacles:
+        if not isinstance(it, dict):
+            continue
+        if it.get("enabled", True) is False:
+            continue
+
+        aabb_min = it.get("aabb_min")
+        aabb_max = it.get("aabb_max")
+        if aabb_min is None or aabb_max is None:
+            c = it.get("center")
+            d = it.get("dims")
+            if c is None or d is None:
+                continue
+            c = np.asarray(c, dtype=np.float32).reshape(3)
+            d = np.asarray(d, dtype=np.float32).reshape(3)
+            aabb_min = (c - 0.5 * d).tolist()
+            aabb_max = (c + 0.5 * d).tolist()
+
+        mn = np.asarray(aabb_min, dtype=np.float32).reshape(3)
+        mx = np.asarray(aabb_max, dtype=np.float32).reshape(3)
+        mins.append(mn)
+        maxs.append(mx)
+        infls.append(float(it.get("inflation_m", obj.get("inflation_default_m", 0.0))))
+
+    if not mins:
+        raise ValueError(f"No enabled obstacles found in {p}")
+
+    mn_all = np.stack(mins, axis=0)
+    mx_all = np.stack(maxs, axis=0)
+    infl = np.asarray(infls, dtype=np.float32).reshape(-1)
+
+    mn_infl = mn_all - infl[:, None]
+    mx_infl = mx_all + infl[:, None]
+
+    return {
+        "aabb_min": mn_all,
+        "aabb_max": mx_all,
+        "aabb_min_infl": mn_infl,
+        "aabb_max_infl": mx_infl,
+    }
 
 
 def _decode_rgb(*, codec: Optional[str], data: Any) -> np.ndarray:
@@ -305,6 +370,41 @@ def _resolve_save_path(base: str, *, step_id: int) -> str:
     return str(out_dir / f"{int(step_id):06d}.npz")
 
 
+def _maybe_dump_pointworld_acceptance(*, pointworld_obs: Optional[Dict[str, Any]], step_id: int) -> None:
+    out_dir = os.getenv("MPPI_PW_ACCEPTANCE_DUMP_DIR", "").strip()
+    if not out_dir or not isinstance(pointworld_obs, dict):
+        return
+
+    def _shape(name: str) -> Optional[list[int]]:
+        if name not in pointworld_obs:
+            return None
+        try:
+            return [int(x) for x in np.asarray(pointworld_obs[name]).shape]
+        except Exception:
+            return None
+
+    summary = {
+        "step_id": int(step_id),
+        "has_scene_flows": "scene_flows" in pointworld_obs,
+        "has_scene_visibility": "scene_visibility" in pointworld_obs,
+        "has_scene_depth_valid_mask": "scene_depth_valid_mask" in pointworld_obs,
+        "has_task_n_obs": "task_n_obs" in pointworld_obs,
+        "has_task_n_infl": "task_n_infl" in pointworld_obs,
+        "has_runtime_policy": "runtime_policy" in pointworld_obs,
+        "scene_flows_shape": _shape("scene_flows"),
+        "scene_visibility_shape": _shape("scene_visibility"),
+        "scene_depth_valid_mask_shape": _shape("scene_depth_valid_mask"),
+        "task_n_obs": int(pointworld_obs.get("task_n_obs", 0) or 0),
+        "task_n_infl": int(pointworld_obs.get("task_n_infl", 0) or 0),
+        "task_selector_reason": str(pointworld_obs.get("task_selector_reason", "") or ""),
+        "runtime_policy": (dict(pointworld_obs.get("runtime_policy", {})) if isinstance(pointworld_obs.get("runtime_policy", {}), dict) else {}),
+    }
+
+    out_path = Path(out_dir).expanduser().resolve() / f"{int(step_id):06d}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def _save_scene_npz(
     *,
     out_path: str,
@@ -437,6 +537,11 @@ class _PointWorldRuntime:
     disabled_until_ts_s: float = 0.0
     last_build_error: str = ""
 
+    task_aabb_min: Optional[np.ndarray] = None
+    task_aabb_max: Optional[np.ndarray] = None
+    task_aabb_min_infl: Optional[np.ndarray] = None
+    task_aabb_max_infl: Optional[np.ndarray] = None
+
     def reset(self) -> None:
         self.window.reset()
         self.query_manager.reset()
@@ -543,7 +648,7 @@ class _PointWorldRuntime:
         obs["gripper_positions"] = g_win.reshape(int(T), 1)
         obs["gripper_open"] = gripper_open
 
-        if _env_bool("MPPI_PW_GRIPPER_POSE_ENABLED", "1"):
+        if _env_bool("MPPI_PW_GRIPPER_POSE_ENABLED", "1" if DEFAULT_PW_GRIPPER_POSE_ENABLED else "0"):
             urdf_path = self.cfg.urdf_path
             if not urdf_path:
                 raise ValueError("cfg.urdf_path is required to compute gripper_pose. Set MPPI_PW_URDF_PATH.")
@@ -551,9 +656,130 @@ class _PointWorldRuntime:
             poses = [fk_T_base_link(urdf_path=str(urdf_path), q7=q_win[i], link_name=link_name) for i in range(int(T))]
             obs["gripper_pose"] = np.stack(poses, axis=0).astype(np.float32, copy=False)
 
+        ablation = os.getenv("MPPI_PW_TASK_ABLATION", DEFAULT_PW_TASK_ABLATION).strip().lower()
+        if ablation not in {"no_pw", "obs_only", "obs_infl"}:
+            ablation = DEFAULT_PW_TASK_ABLATION
+        obs["task_ablation_mode"] = ablation
+
+        if ablation != "no_pw" and (self.task_aabb_min is not None) and (self.task_aabb_max is not None):
+            try:
+                p0 = np.asarray(obs["scene_flows"], dtype=np.float32).reshape(int(T), -1, 3)[0]
+                exists0 = np.asarray(obs["scene_exists"], dtype=bool).reshape(int(T), -1)[0]
+                vis0 = np.asarray(obs["scene_visibility"], dtype=bool).reshape(int(T), -1)[0] if "scene_visibility" in obs else np.ones_like(exists0)
+                dv0 = np.asarray(obs["scene_depth_valid_mask"], dtype=bool).reshape(int(T), -1)[0] if "scene_depth_valid_mask" in obs else np.ones_like(exists0)
+                use_vis = _env_bool("MPPI_PW_TASK_USE_VISIBILITY", "1" if DEFAULT_PW_TASK_USE_VISIBILITY else "0")
+                use_dv = _env_bool("MPPI_PW_TASK_USE_DEPTH_VALID", "1" if DEFAULT_PW_TASK_USE_DEPTH_VALID else "0")
+                valid = exists0.copy()
+                if use_vis:
+                    valid &= vis0
+                if use_dv:
+                    valid &= dv0
+
+                mn = np.asarray(self.task_aabb_min, dtype=np.float32).reshape(-1, 3)
+                mx = np.asarray(self.task_aabb_max, dtype=np.float32).reshape(-1, 3)
+                hit_obs = np.zeros((p0.shape[0],), dtype=bool)
+                for j in range(int(mn.shape[0])):
+                    hit_obs |= (
+                        (p0[:, 0] >= mn[j, 0]) & (p0[:, 0] <= mx[j, 0])
+                        & (p0[:, 1] >= mn[j, 1]) & (p0[:, 1] <= mx[j, 1])
+                        & (p0[:, 2] >= mn[j, 2]) & (p0[:, 2] <= mx[j, 2])
+                    )
+                obs["task_n_obs_raw"] = int(hit_obs.sum())
+                obs["task_n_obs_after_exists"] = int((hit_obs & exists0).sum())
+                obs["task_n_obs_after_visibility"] = int((hit_obs & exists0 & (vis0 if use_vis else np.ones_like(vis0))).sum())
+                obs["task_n_obs_after_depth_valid"] = int((hit_obs & exists0 & (vis0 if use_vis else np.ones_like(vis0)) & (dv0 if use_dv else np.ones_like(dv0))).sum())
+                idx_obs = np.flatnonzero(valid & hit_obs).astype(np.int64, copy=False)
+                if int(idx_obs.size) > 0:
+                    idx_obs = np.unique(idx_obs)
+                min_points = int(os.getenv("MPPI_PW_TASK_MIN_POINTS_OBS", os.getenv("MPPI_PW_TASK_MIN_POINTS", str(DEFAULT_PW_TASK_MIN_POINTS))))
+                if min_points < 1:
+                    min_points = DEFAULT_PW_TASK_MIN_POINTS
+                if int(idx_obs.size) >= int(min_points):
+                    obs["task_point_indices_obs"] = idx_obs
+                    obs["task_goal_positions_obs"] = p0[idx_obs].astype(np.float32, copy=False)
+                    obs["task_weight_obs"] = float(os.getenv("MPPI_PW_TASK_W_OBS", str(DEFAULT_PW_TASK_W_OBS)))
+                    obs["task_n_obs"] = int(idx_obs.size)
+                else:
+                    obs["task_n_obs"] = int(idx_obs.size)
+                    if int(obs["task_n_obs_raw"]) == 0:
+                        obs["task_selector_reason"] = "obs_empty_aabb"
+                    elif int(obs["task_n_obs_after_exists"]) == 0:
+                        obs["task_selector_reason"] = "obs_filtered_by_exists"
+                    elif use_vis and int(obs["task_n_obs_after_visibility"]) == 0:
+                        obs["task_selector_reason"] = "obs_filtered_by_visibility"
+                    elif use_dv and int(obs["task_n_obs_after_depth_valid"]) == 0:
+                        obs["task_selector_reason"] = "obs_filtered_by_depth_valid"
+                    else:
+                        obs["task_selector_reason"] = "obs_too_few_points"
+
+                if ablation == "obs_infl" and (self.task_aabb_min_infl is not None) and (self.task_aabb_max_infl is not None):
+                    mn2 = np.asarray(self.task_aabb_min_infl, dtype=np.float32).reshape(-1, 3)
+                    mx2 = np.asarray(self.task_aabb_max_infl, dtype=np.float32).reshape(-1, 3)
+                    hit_infl = np.zeros((p0.shape[0],), dtype=bool)
+                    for j in range(int(mn2.shape[0])):
+                        hit_infl |= (
+                            (p0[:, 0] >= mn2[j, 0]) & (p0[:, 0] <= mx2[j, 0])
+                            & (p0[:, 1] >= mn2[j, 1]) & (p0[:, 1] <= mx2[j, 1])
+                            & (p0[:, 2] >= mn2[j, 2]) & (p0[:, 2] <= mx2[j, 2])
+                        )
+                    obs["task_n_infl_raw"] = int(hit_infl.sum())
+                    obs["task_n_infl_after_exists"] = int((hit_infl & exists0).sum())
+                    obs["task_n_infl_after_visibility"] = int((hit_infl & exists0 & (vis0 if use_vis else np.ones_like(vis0))).sum())
+                    obs["task_n_infl_after_depth_valid"] = int((hit_infl & exists0 & (vis0 if use_vis else np.ones_like(vis0)) & (dv0 if use_dv else np.ones_like(dv0))).sum())
+                    idx_infl = np.flatnonzero(valid & hit_infl).astype(np.int64, copy=False)
+                    if int(idx_infl.size) > 0:
+                        idx_infl = np.unique(idx_infl)
+                    min_points_infl = int(os.getenv("MPPI_PW_TASK_MIN_POINTS_INFL", os.getenv("MPPI_PW_TASK_MIN_POINTS", str(DEFAULT_PW_TASK_MIN_POINTS))))
+                    if min_points_infl < 1:
+                        min_points_infl = DEFAULT_PW_TASK_MIN_POINTS
+                    if int(idx_infl.size) >= int(min_points_infl):
+                        obs["task_point_indices_infl"] = idx_infl
+                        obs["task_goal_positions_infl"] = p0[idx_infl].astype(np.float32, copy=False)
+                        obs["task_weight_infl"] = float(os.getenv("MPPI_PW_TASK_W_INFL", str(DEFAULT_PW_TASK_W_INFL)))
+                        obs["task_n_infl"] = int(idx_infl.size)
+                    else:
+                        obs["task_n_infl"] = int(idx_infl.size)
+                        if int(obs["task_n_infl_raw"]) == 0:
+                            obs["task_selector_reason"] = obs.get("task_selector_reason", "") or "infl_empty_aabb"
+                        elif int(obs["task_n_infl_after_exists"]) == 0:
+                            obs["task_selector_reason"] = obs.get("task_selector_reason", "") or "infl_filtered_by_exists"
+                        elif use_vis and int(obs["task_n_infl_after_visibility"]) == 0:
+                            obs["task_selector_reason"] = obs.get("task_selector_reason", "") or "infl_filtered_by_visibility"
+                        elif use_dv and int(obs["task_n_infl_after_depth_valid"]) == 0:
+                            obs["task_selector_reason"] = obs.get("task_selector_reason", "") or "infl_filtered_by_depth_valid"
+                        else:
+                            obs["task_selector_reason"] = obs.get("task_selector_reason", "") or "infl_too_few_points"
+
+                if ablation == "obs_only":
+                    obs.pop("task_point_indices_infl", None)
+                    obs.pop("task_goal_positions_infl", None)
+                    obs.pop("task_weight_infl", None)
+                    obs.pop("task_n_infl", None)
+            except Exception as e:
+                obs["task_selector_reason"] = type(e).__name__
+
+        if ablation == "no_pw":
+            obs.pop("task_point_indices_obs", None)
+            obs.pop("task_goal_positions_obs", None)
+            obs.pop("task_weight_obs", None)
+            obs.pop("task_n_obs", None)
+            obs.pop("task_point_indices_infl", None)
+            obs.pop("task_goal_positions_infl", None)
+            obs.pop("task_weight_infl", None)
+            obs.pop("task_n_infl", None)
+
         raw_idx = os.getenv("MPPI_PW_TASK_POINT_INDICES", "").strip()
         raw_goal = os.getenv("MPPI_PW_TASK_GOAL_XYZ", "").strip()
-        if raw_idx and raw_goal:
+        obs["runtime_policy"] = {
+            "seed_robot_mask_enabled": bool(self.cfg.seed_robot_mask_enabled),
+            "gripper_pose_enabled": _env_bool("MPPI_PW_GRIPPER_POSE_ENABLED", "1" if DEFAULT_PW_GRIPPER_POSE_ENABLED else "0"),
+            "task_use_visibility": _env_bool("MPPI_PW_TASK_USE_VISIBILITY", "1" if DEFAULT_PW_TASK_USE_VISIBILITY else "0"),
+            "task_use_depth_valid": _env_bool("MPPI_PW_TASK_USE_DEPTH_VALID", "1" if DEFAULT_PW_TASK_USE_DEPTH_VALID else "0"),
+            "task_ablation_mode": ablation,
+            "cooldown_active": bool(float(ts_s) < float(self.disabled_until_ts_s)),
+        }
+
+        if raw_idx and raw_goal and ("task_point_indices_obs" not in obs) and ("task_point_indices" not in obs):
             try:
                 idx = np.asarray([int(p.strip()) for p in raw_idx.split(",") if p.strip()], dtype=np.int32)
                 goal = np.asarray([float(p.strip()) for p in raw_goal.split(",") if p.strip()], dtype=np.float32)
@@ -587,7 +813,7 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
     ws_min = _env_vec3("MPPI_PW_WORKSPACE_MIN", "0.00,-0.38,-0.30")
     ws_max = _env_vec3("MPPI_PW_WORKSPACE_MAX", "0.80,0.30,1.20")
 
-    seed_robot_mask_enabled = _env_bool("MPPI_PW_SEED_ROBOT_MASK_ENABLED", "0")
+    seed_robot_mask_enabled = _env_bool("MPPI_PW_SEED_ROBOT_MASK_ENABLED", "1" if DEFAULT_PW_SEED_ROBOT_MASK_ENABLED else "0")
     robot_mask_seed = int(os.getenv("MPPI_PW_ROBOT_MASK_SEED", "0"))
 
     ee_filter_enabled = _env_bool("MPPI_PW_EE_FILTER_ENABLED", "0")
@@ -595,6 +821,10 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
     ee_filter_spheres = parse_spheres_spec(os.getenv("MPPI_PW_EE_FILTER_SPHERES", ""))
 
     urdf_path = os.getenv("MPPI_PW_URDF_PATH", os.getenv("MPPI_URDF_PATH", "")).strip() or None
+    if seed_robot_mask_enabled and not urdf_path:
+        raise ValueError("MPPI_PW_SEED_ROBOT_MASK_ENABLED=1 requires MPPI_PW_URDF_PATH (or MPPI_URDF_PATH)")
+    if _env_bool("MPPI_PW_GRIPPER_POSE_ENABLED", "1" if DEFAULT_PW_GRIPPER_POSE_ENABLED else "0") and not urdf_path:
+        raise ValueError("MPPI_PW_GRIPPER_POSE_ENABLED=1 requires MPPI_PW_URDF_PATH (or MPPI_URDF_PATH)")
 
     tracking = TrackingConfig(
         max_query_points_per_camera=int(max_q),
@@ -636,7 +866,7 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
         urdf_path = os.getenv("MPPI_PW_URDF_PATH", os.getenv("MPPI_URDF_PATH", "")).strip() or default_urdf_path()
 
         cost_cfg = PointWorldCostConfig(
-            mode=str(os.getenv("MPPI_PW_COST_MODE", "flow_l2")),
+            mode=str(os.getenv("MPPI_PW_COST_MODE", "task_point_goal_l2")),
             use_model_confidence=_env_bool("MPPI_PW_USE_MODEL_CONFIDENCE", "1"),
             use_track_confidence=_env_bool("MPPI_PW_USE_TRACK_CONFIDENCE", "1"),
             min_confidence=float(os.getenv("MPPI_PW_MIN_COST_CONFIDENCE", "0.0")),
@@ -667,13 +897,27 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
             )
         )
 
-    return _PointWorldRuntime(
+    rt = _PointWorldRuntime(
         cfg=cfg,
         window=window,
         builder=builder,
         query_manager=query_manager,
         cost_model=cost_model,
     )
+
+    default_aabb_path = DEFAULT_PW_AABB_CONFIG_PATH if Path(DEFAULT_PW_AABB_CONFIG_PATH).is_file() else ""
+    aabb_path = os.getenv("MPPI_PW_AABB_CONFIG_PATH", default_aabb_path).strip()
+    if aabb_path:
+        try:
+            a = _load_aabb_config_json(aabb_path)
+            rt.task_aabb_min = np.asarray(a["aabb_min"], dtype=np.float32)
+            rt.task_aabb_max = np.asarray(a["aabb_max"], dtype=np.float32)
+            rt.task_aabb_min_infl = np.asarray(a["aabb_min_infl"], dtype=np.float32)
+            rt.task_aabb_max_infl = np.asarray(a["aabb_max_infl"], dtype=np.float32)
+        except Exception as e:
+            raise ValueError(f"Failed to load MPPI_PW_AABB_CONFIG_PATH={aabb_path}: {type(e).__name__}") from e
+
+    return rt
 
 
 async def _handle_connection(
@@ -824,6 +1068,7 @@ async def _handle_connection(
                         q=np.asarray(obs.q, dtype=np.float32),
                         gripper=float(obs.gripper),
                     )
+                    _maybe_dump_pointworld_acceptance(pointworld_obs=pw.last_pointworld_obs, step_id=int(obs.step_id))
                 except Exception:
                     pw.reset()
 
