@@ -192,19 +192,19 @@ def reduce_pointworld_cost_torch(
 
         if bool(ccfg.use_model_confidence) and model_confidence is not None:
             mc = torch.as_tensor(model_confidence, device=rel.device, dtype=torch.float32)
-            mc = mc[:, 1:] if bool(ccfg.ignore_t0) and mc.shape[1] > 1 else mc
-            mc = mc[:, -1:] if mode.startswith("final_") and mc.shape[1] > 1 else mc
-            if tuple(mc.shape) != tuple(exists.shape):
-                raise ValueError(f"model_confidence shape {tuple(mc.shape)} must match scene_exists shape {tuple(exists.shape)}")
-            weight = weight * torch.clamp(mc.index_select(dim=2, index=idx), min=float(ccfg.min_confidence), max=1.0)
+            mc_eval = mc[:, 1:] if bool(ccfg.ignore_t0) and mc.shape[1] > 1 else mc
+            mc_task = mc_eval[:, -1:] if mode.startswith("final_") and mc_eval.shape[1] > 1 else mc_eval
+            if tuple(mc_task.shape) != tuple(exists_task.shape):
+                raise ValueError(f"model_confidence shape {tuple(mc_task.shape)} must match exists shape {tuple(exists_task.shape)}")
+            weight = weight * torch.clamp(mc_task.index_select(dim=2, index=idx), min=float(ccfg.min_confidence), max=1.0)
 
         if bool(ccfg.use_track_confidence) and track_confidence is not None:
             tc = torch.as_tensor(track_confidence, device=rel.device, dtype=torch.float32)
-            tc = tc[:, 1:] if bool(ccfg.ignore_t0) and tc.shape[1] > 1 else tc
-            tc = tc[:, -1:] if mode.startswith("final_") and tc.shape[1] > 1 else tc
-            if tuple(tc.shape) != tuple(exists.shape):
-                raise ValueError(f"track_confidence shape {tuple(tc.shape)} must match scene_exists shape {tuple(exists.shape)}")
-            weight = weight * torch.clamp(tc.index_select(dim=2, index=idx), min=float(ccfg.min_confidence), max=1.0)
+            tc_eval = tc[:, 1:] if bool(ccfg.ignore_t0) and tc.shape[1] > 1 else tc
+            tc_task = tc_eval[:, -1:] if mode.startswith("final_") and tc_eval.shape[1] > 1 else tc_eval
+            if tuple(tc_task.shape) != tuple(exists_task.shape):
+                raise ValueError(f"track_confidence shape {tuple(tc_task.shape)} must match exists shape {tuple(exists_task.shape)}")
+            weight = weight * torch.clamp(tc_task.index_select(dim=2, index=idx), min=float(ccfg.min_confidence), max=1.0)
 
         numer = torch.sum(point_cost * weight, dim=(1, 2))
         denom = torch.sum(weight, dim=(1, 2)).clamp_min(float(ccfg.eps))
@@ -223,16 +223,16 @@ def reduce_pointworld_cost_torch(
         mc = torch.as_tensor(model_confidence, device=rel.device, dtype=torch.float32)
         mc_eval = mc[:, 1:] if bool(ccfg.ignore_t0) and mc.shape[1] > 1 else mc
         mc_task = mc_eval[:, -1:] if mode.startswith("final_") and mc_eval.shape[1] > 1 else mc_eval
-        if tuple(mc_task.shape) != tuple(exists_task.shape):
-            raise ValueError(f"model_confidence shape {tuple(mc_task.shape)} must match exists shape {tuple(exists_task.shape)}")
+        if tuple(mc_task.shape) != tuple(exists_eval.shape):
+            raise ValueError(f"model_confidence shape {tuple(mc_task.shape)} must match exists shape {tuple(exists_eval.shape)}")
         weight = weight * torch.clamp(mc_task, min=float(ccfg.min_confidence), max=1.0)
 
     if bool(ccfg.use_track_confidence) and track_confidence is not None:
         tc = torch.as_tensor(track_confidence, device=rel.device, dtype=torch.float32)
         tc_eval = tc[:, 1:] if bool(ccfg.ignore_t0) and tc.shape[1] > 1 else tc
         tc_task = tc_eval[:, -1:] if mode.startswith("final_") and tc_eval.shape[1] > 1 else tc_eval
-        if tuple(tc_task.shape) != tuple(exists_task.shape):
-            raise ValueError(f"track_confidence shape {tuple(tc_task.shape)} must match exists shape {tuple(exists_task.shape)}")
+        if tuple(tc_task.shape) != tuple(exists_eval.shape):
+            raise ValueError(f"track_confidence shape {tuple(tc_task.shape)} must match exists shape {tuple(exists_eval.shape)}")
         weight = weight * torch.clamp(tc_task, min=float(ccfg.min_confidence), max=1.0)
 
     numer = torch.sum(point_cost * weight, dim=(1, 2))

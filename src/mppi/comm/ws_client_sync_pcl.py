@@ -73,39 +73,49 @@ def _encode_depth_npy_zlib(depth_m: np.ndarray, *, level: int = 3) -> bytes:
     return zlib.compress(raw, level=int(level))
 
 
-async def infer_once(
-    cfg: ClientConfig,
-    *,
-    q: list[float],
-    gripper: float,
-    step_id: int,
-    rgb: np.ndarray,
-    depth: np.ndarray,
-    cam_id: str,
-    depth_unit_scale: Optional[float],
-) -> Dict[str, Any]:
-    websockets = _require_websockets()
-
+def _camera_payload(*, rgb: np.ndarray, depth: np.ndarray, depth_unit_scale: float) -> Dict[str, Any]:
     rgb_arr = np.asarray(rgb)
     depth_arr = np.asarray(depth)
 
     rgb_bytes = _encode_rgb_jpeg(rgb_arr, quality=int(90))
     depth_bytes = _encode_depth_npy_zlib(depth_arr, level=int(3))
 
+    return {
+        "rgb_codec": "jpeg",
+        "rgb_bytes": rgb_bytes,
+        "rgb_shape_hw": [int(rgb_arr.shape[0]), int(rgb_arr.shape[1])],
+        "depth_codec": "npy_zlib",
+        "depth_bytes": depth_bytes,
+        "depth_shape_hw": [int(depth_arr.shape[0]), int(depth_arr.shape[1])],
+        "depth_unit_scale": float(depth_unit_scale),
+    }
+
+
+async def infer_once(
+    cfg: ClientConfig,
+    *,
+    q: list[float],
+    gripper: float,
+    step_id: int,
+    cameras: Dict[str, Dict[str, Any]],
+    primary_cam_id: str = "back",
+) -> Dict[str, Any]:
+    websockets = _require_websockets()
+
+    for need in ("back", "side"):
+        if str(need) not in cameras:
+            raise ValueError(f"Missing required camera payload: {need}")
+
     obs = ObsPCL(
         t_client_send_ns=time.time_ns(),
         step_id=int(step_id),
         q=list(q),
         gripper=float(gripper),
-        rgb_codec="jpeg",
-        rgb_bytes=rgb_bytes,
-        rgb_shape_hw=[int(rgb_arr.shape[0]), int(rgb_arr.shape[1])],
-        depth_codec="npy_zlib",
-        depth_bytes=depth_bytes,
-        depth_shape_hw=[int(depth_arr.shape[0]), int(depth_arr.shape[1])],
-        cam_id=str(cam_id),
-        depth_unit_scale=(float(depth_unit_scale) if depth_unit_scale is not None else 1.0),
+        cam_id=str(primary_cam_id),
+        depth_unit_scale=float(cameras[str(primary_cam_id)].get("depth_unit_scale", 1.0)),
+        cameras={str(k): dict(v) for k, v in dict(cameras).items()},
     )
+
     req = InferRequestPCL(request_id=str(uuid.uuid4()), obs=obs).to_envelope()
     payload = encode_message(req)
 
@@ -133,11 +143,14 @@ async def infer_once(
 def main(argv: Optional[list[str]] = None) -> None:
     ap = argparse.ArgumentParser(prog="ws_client_sync_pcl")
     ap.add_argument("--url", type=str, required=True)
-    ap.add_argument("--rgb", type=str, required=True)
-    ap.add_argument("--depth", type=str, required=True)
+    ap.add_argument("--rgb-back", type=str, required=True)
+    ap.add_argument("--depth-back", type=str, required=True)
+    ap.add_argument("--rgb-side", type=str, required=True)
+    ap.add_argument("--depth-side", type=str, required=True)
     ap.add_argument("--request-timeout-s", type=float, default=2.0)
-    ap.add_argument("--cam-id", type=str, default="back")
     ap.add_argument("--depth-unit-scale", type=float, default=None)
+    ap.add_argument("--depth-unit-scale-back", type=float, default=None)
+    ap.add_argument("--depth-unit-scale-side", type=float, default=None)
     ap.add_argument("--gripper", type=float, default=0.0)
     ap.add_argument("--step-id", type=int, default=0)
     ap.add_argument("--initial-q", type=str, default="")
@@ -151,8 +164,19 @@ def main(argv: Optional[list[str]] = None) -> None:
             raise ValueError("--initial-q must be 7 comma-separated floats")
         q0 = [float(x) for x in parts]
 
-    rgb = load_rgb_any(str(args.rgb))
-    depth = load_depth_any(str(args.depth))
+    rgb_back = load_rgb_any(str(args.rgb_back))
+    depth_back = load_depth_any(str(args.depth_back))
+    rgb_side = load_rgb_any(str(args.rgb_side))
+    depth_side = load_depth_any(str(args.depth_side))
+
+    default_scale = float(args.depth_unit_scale) if args.depth_unit_scale is not None else 1.0
+    scale_back = float(args.depth_unit_scale_back) if args.depth_unit_scale_back is not None else default_scale
+    scale_side = float(args.depth_unit_scale_side) if args.depth_unit_scale_side is not None else default_scale
+
+    cameras = {
+        "back": _camera_payload(rgb=np.asarray(rgb_back), depth=np.asarray(depth_back), depth_unit_scale=scale_back),
+        "side": _camera_payload(rgb=np.asarray(rgb_side), depth=np.asarray(depth_side), depth_unit_scale=scale_side),
+    }
 
     cfg = ClientConfig(url=str(args.url), request_timeout_s=float(args.request_timeout_s))
     payload = asyncio.run(
@@ -161,10 +185,8 @@ def main(argv: Optional[list[str]] = None) -> None:
             q=q0,
             gripper=float(args.gripper),
             step_id=int(args.step_id),
-            rgb=np.asarray(rgb),
-            depth=np.asarray(depth),
-            cam_id=str(args.cam_id),
-            depth_unit_scale=(float(args.depth_unit_scale) if args.depth_unit_scale is not None else None),
+            cameras=cameras,
+            primary_cam_id="back",
         )
     )
 

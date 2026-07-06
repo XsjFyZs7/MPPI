@@ -1,0 +1,49 @@
+{
+  "step_id": 15,
+  "has_scene_flows": true,
+  "has_scene_visibility": true,
+  "has_scene_depth_valid_mask": true,
+  "has_task_n_obs": true,
+  "has_task_n_infl": true,
+  "has_runtime_policy": true,
+  "scene_flows_shape": [
+    11,
+    4096,
+    3
+  ],
+  "scene_visibility_shape": [
+    11,
+    4096
+  ],
+  "scene_depth_valid_mask_shape": [
+    11,
+    4096
+  ],
+  "task_n_obs": 1953,
+  "task_n_infl": 2722,
+  "task_selector_reason": "",
+  "runtime_policy": {
+    "seed_robot_mask_enabled": true,
+    "gripper_pose_enabled": true,
+    "task_use_visibility": true,
+    "task_use_depth_valid": true,
+    "task_ablation_mode": "obs_infl",
+    "cooldown_active": false
+  },
+  "pw_cost_debug": {
+    "enabled": true,
+    "reason": "ok",
+    "ms": 5194.895783439279
+  },
+  "timing_breakdown": {
+    "request_id": "ad3debf2-2f9b-4002-b89d-716d6d1d932e",
+    "step_id": 15,
+    "t_decode_ms": 0.140458345413208,
+    "t_cameras_ms": 10.942457243800163,
+    "t_pw_build_ms": 3478.130904957652,
+    "pcd_points": 107714,
+    "t_pcd_ms": 8.32748506218195,
+    "t_solver_ms": 5196.644047275186,
+    "pw_ms": 5194.895783439279
+  }
+}

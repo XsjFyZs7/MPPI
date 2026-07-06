@@ -13,8 +13,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from mppi.comm.ws_server_async import _get_joint_solver
-from mppi.mpc.solver import PointWorldCostFn
+from mppi.mpc.solver import JointMPPIConfig, JointMPPISolver, PointWorldCostFn
 from mppi.curobo_ext.check_depth_pcl import (
     load_T_row_major_4x4_yaml,
     load_intrinsics_from_cam_info_yaml,
@@ -69,6 +68,9 @@ class ServerConfig:
     cam_id: str = "back"
 
 
+REQUIRED_CAM_IDS: Tuple[str, ...] = ("back", "side")
+
+
 def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes")
 
@@ -87,6 +89,76 @@ def _env_vec3(name: str, default: str) -> Tuple[float, float, float]:
     if len(parts) != 3:
         raise ValueError(f"{name} must be 'x,y,z'")
     return (float(parts[0]), float(parts[1]), float(parts[2]))
+
+
+_JOINT_SOLVERS: dict[int, JointMPPISolver] = {}
+
+
+def _get_joint_solver(open_loop_horizon: int) -> JointMPPISolver:
+    h = int(open_loop_horizon)
+    if h in _JOINT_SOLVERS:
+        return _JOINT_SOLVERS[h]
+
+    urdf_path = os.getenv("MPPI_URDF_PATH", "").strip() or default_urdf_path()
+
+    cfg = JointMPPIConfig(
+        horizon=h,
+        num_samples=int(os.getenv("MPPI_NUM_SAMPLES", "256")),
+        infer_budget_ms=float(os.getenv("MPPI_INFER_BUDGET_MS", "0.0")),
+        budget_max_dynamic_cuboids=int(os.getenv("MPPI_BUDGET_MAX_DYNAMIC_CUBOIDS", "0")),
+        debug_cost_stats=_env_bool("MPPI_DEBUG_COST_STATS", "0"),
+        debug_cost_stats_q=float(os.getenv("MPPI_DEBUG_COST_STATS_Q", "0.5")),
+        temperature=float(os.getenv("MPPI_TEMPERATURE", "1.0")),
+        noise_std=float(os.getenv("MPPI_NOISE_STD", "0.05")),
+        dt=float(os.getenv("MPPI_DT", "1.0")),
+        w_smooth=float(os.getenv("MPPI_W_SMOOTH", "1.0")),
+        w_action=float(os.getenv("MPPI_W_ACTION", "0.01")),
+        w_joint_limit=float(os.getenv("MPPI_W_JOINT_LIMIT", "50.0")),
+        use_curobo_collision=_env_bool("MPPI_USE_CUROBO_COLLISION", "0"),
+        w_scene_collision=float(os.getenv("MPPI_W_SCENE_COLLISION", "1.0")),
+        w_self_collision=float(os.getenv("MPPI_W_SELF_COLLISION", os.getenv("MPPI_W_SCENE_COLLISION", "1.0"))),
+        curobo_device=str(os.getenv("MPPI_CUROBO_DEVICE", "cuda:0")),
+        curobo_robot_yaml=str(os.getenv("MPPI_CUROBO_ROBOT_YAML", "franka.yml")),
+        curobo_tool_frame=str(os.getenv("MPPI_CUROBO_TOOL_FRAME", "robotiq_85_base_link")),
+        curobo_with_world=_env_bool("MPPI_CUROBO_WITH_WORLD", "1"),
+        curobo_collision_activation_distance=float(os.getenv("MPPI_CUROBO_COLLISION_ACTIVATION_DISTANCE", "0.2")),
+        curobo_self_collision_activation_distance=float(os.getenv("MPPI_CUROBO_SELF_COLLISION_ACTIVATION_DISTANCE", "0.0")),
+        curobo_max_collision_distance=float(os.getenv("MPPI_CUROBO_MAX_COLLISION_DISTANCE", "1.0")),
+        scene_from_pcd_back_cam=_env_bool("MPPI_SCENE_FROM_PCD_BACK_CAM", "0"),
+        scene_pcd_scale=float(os.getenv("MPPI_SCENE_PCD_SCALE", "1.0")),
+        scene_pcd_in_base=_env_bool("MPPI_SCENE_PCD_IN_BASE", "1"),
+        scene_add_table=_env_bool("MPPI_SCENE_ADD_TABLE", "1"),
+        scene_table_dims=_env_vec3("MPPI_SCENE_TABLE_DIMS", "2.0,2.0,0.2"),
+        scene_table_center=_env_vec3("MPPI_SCENE_TABLE_CENTER", "0.4,0.0,-0.1"),
+        scene_remove_table_points=_env_bool("MPPI_SCENE_REMOVE_TABLE_POINTS", "1"),
+        scene_table_eps_m=float(os.getenv("MPPI_SCENE_TABLE_EPS_M", "0.01")),
+        scene_remove_wall_points=_env_bool("MPPI_SCENE_REMOVE_WALL_POINTS", "0"),
+        scene_wall_dims=_env_vec3("MPPI_SCENE_WALL_DIMS", "0.0,0.0,0.0"),
+        scene_wall_center=_env_vec3("MPPI_SCENE_WALL_CENTER", "0.0,0.0,0.0"),
+        scene_wall_margin_m=float(os.getenv("MPPI_SCENE_WALL_MARGIN_M", "0.02")),
+        t_base_cam_back_path=str(os.getenv("MPPI_T_BASE_CAM_BACK_PATH", repo_path("configs", "T_base_cam.yaml"))),
+        scene_roi_min=_env_vec3("MPPI_SCENE_ROI_MIN", "-0.1,-0.7,-0.05"),
+        scene_roi_max=_env_vec3("MPPI_SCENE_ROI_MAX", "1.2,0.7,1.2"),
+        scene_voxel_size_m=float(os.getenv("MPPI_SCENE_VOXEL_SIZE_M", "0.01")),
+        scene_padding_m=float(os.getenv("MPPI_SCENE_PADDING_M", "0.02")),
+        scene_max_cuboids=int(os.getenv("MPPI_SCENE_MAX_CUBOIDS", "20")),
+        scene_robot_mask_margin_m=float(os.getenv("MPPI_SCENE_ROBOT_MASK_MARGIN_M", "0.02")),
+        scene_min_cluster_voxels=int(os.getenv("MPPI_SCENE_MIN_CLUSTER_VOXELS", "10")),
+        scene_track_alpha=float(os.getenv("MPPI_SCENE_TRACK_ALPHA", "0.6")),
+        scene_track_remove_after_misses=int(os.getenv("MPPI_SCENE_TRACK_REMOVE_AFTER_MISSES", "5")),
+        scene_track_max_tracks=int(os.getenv("MPPI_SCENE_TRACK_MAX_TRACKS", "20")),
+        scene_track_match_center_dist_m=float(os.getenv("MPPI_SCENE_TRACK_MATCH_CENTER_DIST_M", "0.10")),
+        scene_track_match_iou_min=float(os.getenv("MPPI_SCENE_TRACK_MATCH_IOU_MIN", "0.05")),
+        min_effective_samples_ratio=float(os.getenv("MPPI_MIN_EFFECTIVE_SAMPLES_RATIO", "0.01")),
+        use_pointworld_cost=_env_bool("MPPI_USE_POINTWORLD_COST", "0"),
+        w_pointworld=float(os.getenv("MPPI_W_POINTWORLD", "0.0")),
+        pointworld_cost_timeout_ms=float(os.getenv("MPPI_PW_COST_TIMEOUT_MS", "0.0")),
+        urdf_path=str(urdf_path),
+    )
+
+    solver = JointMPPISolver(cfg)
+    _JOINT_SOLVERS[h] = solver
+    return solver
 
 
 DEFAULT_PW_AABB_CONFIG_PATH = str(repo_path("configs/pointworld_static_aabbs.json"))
@@ -370,7 +442,13 @@ def _resolve_save_path(base: str, *, step_id: int) -> str:
     return str(out_dir / f"{int(step_id):06d}.npz")
 
 
-def _maybe_dump_pointworld_acceptance(*, pointworld_obs: Optional[Dict[str, Any]], step_id: int) -> None:
+def _maybe_dump_pointworld_acceptance(
+    *,
+    pointworld_obs: Optional[Dict[str, Any]],
+    step_id: int,
+    pw_cost_debug: Optional[Dict[str, Any]] = None,
+    timing_breakdown: Optional[Dict[str, Any]] = None,
+) -> None:
     out_dir = os.getenv("MPPI_PW_ACCEPTANCE_DUMP_DIR", "").strip()
     if not out_dir or not isinstance(pointworld_obs, dict):
         return
@@ -383,7 +461,7 @@ def _maybe_dump_pointworld_acceptance(*, pointworld_obs: Optional[Dict[str, Any]
         except Exception:
             return None
 
-    summary = {
+    summary: Dict[str, Any] = {
         "step_id": int(step_id),
         "has_scene_flows": "scene_flows" in pointworld_obs,
         "has_scene_visibility": "scene_visibility" in pointworld_obs,
@@ -399,6 +477,12 @@ def _maybe_dump_pointworld_acceptance(*, pointworld_obs: Optional[Dict[str, Any]
         "task_selector_reason": str(pointworld_obs.get("task_selector_reason", "") or ""),
         "runtime_policy": (dict(pointworld_obs.get("runtime_policy", {})) if isinstance(pointworld_obs.get("runtime_policy", {}), dict) else {}),
     }
+
+    if isinstance(pw_cost_debug, dict) and pw_cost_debug:
+        summary["pw_cost_debug"] = dict(pw_cost_debug)
+
+    if isinstance(timing_breakdown, dict) and timing_breakdown:
+        summary["timing_breakdown"] = dict(timing_breakdown)
 
     out_path = Path(out_dir).expanduser().resolve() / f"{int(step_id):06d}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -511,9 +595,13 @@ def _load_cam_configs_from_env(default_cam_id: str) -> dict[str, tuple[Any, np.n
         T = load_T_row_major_4x4_yaml(T_path).astype(np.float32)
         out[str(cam_id)] = (intr, T)
 
-    _load_one(default_cam_id)
-    if str(default_cam_id) != "back":
-        _load_one("back")
+    seen: set[str] = set()
+    for cam_id in (str(default_cam_id),) + REQUIRED_CAM_IDS:
+        c = str(cam_id)
+        if c in seen:
+            continue
+        seen.add(c)
+        _load_one(c)
 
     return out
 
@@ -849,8 +937,9 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
         urdf_path=urdf_path,
         seed_robot_mask_enabled=bool(seed_robot_mask_enabled),
         robot_mask_seed=int(robot_mask_seed),
-        camera_selection="all_available",
-        min_cameras=1,
+        camera_names=REQUIRED_CAM_IDS,
+        camera_selection="subset",
+        min_cameras=len(REQUIRED_CAM_IDS),
     )
 
     window = PointWorldWindowBuffer(window_size=11)
@@ -926,16 +1015,33 @@ async def _handle_connection(
     cam_configs: dict[str, tuple[Any, np.ndarray]],
     pw: Optional[_PointWorldRuntime],
 ) -> None:
+    verbose = _env_bool("MPPI_PCL_VERBOSE", "1")
+    print_every = max(1, int(os.getenv("MPPI_PCL_PRINT_EVERY", "1")))
+    heartbeat_s = float(os.getenv("MPPI_PCL_HEARTBEAT_S", "5.0"))
+
+    conn_id = hex(id(ws))
+    remote = getattr(ws, "remote_address", None)
+    if verbose:
+        print(f"[pcl_server] connect id={conn_id} remote={remote}")
+
+    last_hb_s = time.time()
+    n_req = 0
+
     while True:
         try:
             data = await asyncio.wait_for(ws.recv(), timeout=cfg.request_timeout_s)
         except asyncio.TimeoutError:
+            now_s = time.time()
+            if verbose and heartbeat_s > 0.0 and (now_s - last_hb_s) >= heartbeat_s:
+                print(f"[pcl_server] heartbeat id={conn_id} policy={cfg.policy} waiting")
+                last_hb_s = now_s
             continue
         except Exception:
             break
 
         t_server_recv_ns = time.time_ns()
         t0 = time.perf_counter()
+        tb: Dict[str, Any] = {}
 
         try:
             if isinstance(data, str):
@@ -949,14 +1055,23 @@ async def _handle_connection(
 
             request_id = str(envelope["request_id"])
             obs = ObsPCL.from_payload(dict(envelope["payload"]))
+            n_req += 1
+
+            tb["request_id"] = request_id
+            tb["step_id"] = int(getattr(obs, "step_id", -1))
+            tb["t_decode_ms"] = (time.perf_counter() - t0) * 1000.0
 
             depth_min_m = _env_f("MPPI_PCL_DEPTH_MIN_M", "0.0")
             depth_max_m = _env_f("MPPI_PCL_DEPTH_MAX_M", "4.0")
             stride = _env_i("MPPI_PCL_STRIDE", "1")
 
-            primary_cam_id = str(obs.cam_id) if obs.cam_id is not None else str(cfg.cam_id)
+            primary_cam_id = "back"
 
             pw_cameras: Dict[str, PWCameraFrame] = {}
+            intr_by_cam: Dict[str, Any] = {}
+            T_by_cam: Dict[str, Any] = {}
+            depth_unit_scale_by_cam: Dict[str, float] = {}
+
             rgb_primary = None
             depth_primary = None
             intr_primary = None
@@ -964,102 +1079,73 @@ async def _handle_connection(
             depth_unit_scale_primary = float(obs.depth_unit_scale) if obs.depth_unit_scale is not None else _env_f("MPPI_PCL_DEPTH_UNIT_SCALE", "1.0")
 
             cams_payload = getattr(obs, "cameras", None)
-            if isinstance(cams_payload, dict) and cams_payload:
-                if primary_cam_id not in cams_payload:
-                    primary_cam_id = sorted(str(k) for k in cams_payload.keys())[0]
+            if not (isinstance(cams_payload, dict) and cams_payload):
+                raise ValueError("This server requires ObsPCL.cameras with back+side. Use tests/pw_replay_acceptance.py or implement a dual-view client.")
 
-                for cam_name_raw, cam_pl in cams_payload.items():
-                    cam_name = str(cam_name_raw)
-                    if not isinstance(cam_pl, dict):
-                        raise ValueError(f"cameras[{cam_name}] must be a dict")
+            for need in REQUIRED_CAM_IDS:
+                if str(need) not in cams_payload:
+                    raise ValueError(f"Missing required camera in payload: {need}")
 
-                    intr_i, T_i = parse_obs_camera_params(
-                        cam_id=cam_name,
-                        intrinsics=(dict(cam_pl["intrinsics"]) if "intrinsics" in cam_pl and cam_pl["intrinsics"] is not None else None),
-                        T_base_cam=(cam_pl.get("T_base_cam", None)),
-                        cam_configs=cam_configs,
-                    )
+            t_cam0 = time.perf_counter()
+            for cam_name_raw, cam_pl in cams_payload.items():
+                cam_name = str(cam_name_raw)
+                if not isinstance(cam_pl, dict):
+                    raise ValueError(f"cameras[{cam_name}] must be a dict")
 
-                    if cam_pl.get("rgb_bytes", None) is not None:
-                        rgb_i = _decode_rgb(codec=(cam_pl.get("rgb_codec", None)), data=cam_pl.get("rgb_bytes", None))
-                    elif cam_pl.get("rgb_back", None) is not None:
-                        rgb_i = np.asarray(cam_pl.get("rgb_back", None))
-                    else:
-                        raise ValueError(f"Missing rgb for camera {cam_name}")
-
-                    if cam_pl.get("depth_bytes", None) is not None:
-                        depth_i = _decode_depth(codec=(cam_pl.get("depth_codec", None)), data=cam_pl.get("depth_bytes", None))
-                    elif cam_pl.get("depth_back", None) is not None:
-                        depth_i = np.asarray(cam_pl.get("depth_back", None))
-                    else:
-                        raise ValueError(f"Missing depth for camera {cam_name}")
-
-                    rgb_i, depth_i, intr_i = _resize_rgbd_to_contract(rgb=np.asarray(rgb_i), depth=np.asarray(depth_i), intr=intr_i)
-
-                    intr_pw = PWPinholeIntrinsics(fx=float(intr_i.fx), fy=float(intr_i.fy), cx=float(intr_i.cx), cy=float(intr_i.cy))
-                    pw_cameras[cam_name] = PWCameraFrame(
-                        rgb=np.asarray(rgb_i),
-                        depth=np.asarray(depth_i),
-                        intrinsics=intr_pw,
-                        extrinsics=np.asarray(T_i, dtype=np.float32).reshape(4, 4),
-                    )
-
-                    if cam_name == primary_cam_id:
-                        rgb_primary = np.asarray(rgb_i)
-                        depth_primary = np.asarray(depth_i)
-                        intr_primary = intr_i
-                        T_primary = T_i
-                        depth_unit_scale_primary = (
-                            float(cam_pl["depth_unit_scale"])
-                            if "depth_unit_scale" in cam_pl and cam_pl["depth_unit_scale"] is not None
-                            else depth_unit_scale_primary
-                        )
-            else:
-                intr_primary, T_primary = parse_obs_camera_params(
-                    cam_id=primary_cam_id,
-                    intrinsics=obs.intrinsics,
-                    T_base_cam=obs.T_base_cam,
+                intr_i, T_i = parse_obs_camera_params(
+                    cam_id=cam_name,
+                    intrinsics=(dict(cam_pl["intrinsics"]) if "intrinsics" in cam_pl and cam_pl["intrinsics"] is not None else None),
+                    T_base_cam=(cam_pl.get("T_base_cam", None)),
                     cam_configs=cam_configs,
                 )
 
-                if obs.rgb_bytes is not None:
-                    rgb_primary = _decode_rgb(codec=obs.rgb_codec, data=obs.rgb_bytes)
-                elif obs.rgb_back is not None:
-                    rgb_primary = np.asarray(obs.rgb_back)
+                if cam_pl.get("rgb_bytes", None) is not None:
+                    rgb_i = _decode_rgb(codec=(cam_pl.get("rgb_codec", None)), data=cam_pl.get("rgb_bytes", None))
+                elif cam_pl.get("rgb_back", None) is not None:
+                    rgb_i = np.asarray(cam_pl.get("rgb_back", None))
                 else:
-                    raise ValueError("Missing rgb payload: provide rgb_bytes or rgb_back")
+                    raise ValueError(f"Missing rgb for camera {cam_name}")
 
-                if obs.depth_bytes is not None:
-                    depth_primary = _decode_depth(codec=obs.depth_codec, data=obs.depth_bytes)
-                elif obs.depth_back is not None:
-                    depth_primary = np.asarray(obs.depth_back)
+                if cam_pl.get("depth_bytes", None) is not None:
+                    depth_i = _decode_depth(codec=(cam_pl.get("depth_codec", None)), data=cam_pl.get("depth_bytes", None))
+                elif cam_pl.get("depth_back", None) is not None:
+                    depth_i = np.asarray(cam_pl.get("depth_back", None))
                 else:
-                    raise ValueError("Missing depth payload: provide depth_bytes or depth_back")
+                    raise ValueError(f"Missing depth for camera {cam_name}")
 
-                rgb_primary, depth_primary, intr_primary = _resize_rgbd_to_contract(
-                    rgb=np.asarray(rgb_primary),
-                    depth=np.asarray(depth_primary),
-                    intr=intr_primary,
+                rgb_i, depth_i, intr_i = _resize_rgbd_to_contract(rgb=np.asarray(rgb_i), depth=np.asarray(depth_i), intr=intr_i)
+
+                intr_pw = PWPinholeIntrinsics(fx=float(intr_i.fx), fy=float(intr_i.fy), cx=float(intr_i.cx), cy=float(intr_i.cy))
+                pw_cameras[cam_name] = PWCameraFrame(
+                    rgb=np.asarray(rgb_i),
+                    depth=np.asarray(depth_i),
+                    intrinsics=intr_pw,
+                    extrinsics=np.asarray(T_i, dtype=np.float32).reshape(4, 4),
                 )
 
-                intr_pw0 = PWPinholeIntrinsics(
-                    fx=float(intr_primary.fx),
-                    fy=float(intr_primary.fy),
-                    cx=float(intr_primary.cx),
-                    cy=float(intr_primary.cy),
+                intr_by_cam[cam_name] = intr_i
+                T_by_cam[cam_name] = T_i
+                depth_unit_scale_by_cam[cam_name] = (
+                    float(cam_pl["depth_unit_scale"])
+                    if "depth_unit_scale" in cam_pl and cam_pl["depth_unit_scale"] is not None
+                    else depth_unit_scale_primary
                 )
-                pw_cameras[primary_cam_id] = PWCameraFrame(
-                    rgb=np.asarray(rgb_primary),
-                    depth=np.asarray(depth_primary),
-                    intrinsics=intr_pw0,
-                    extrinsics=np.asarray(T_primary, dtype=np.float32).reshape(4, 4),
-                )
+
+                if cam_name == primary_cam_id:
+                    rgb_primary = np.asarray(rgb_i)
+                    depth_primary = np.asarray(depth_i)
+                    intr_primary = intr_i
+                    T_primary = T_i
+                    depth_unit_scale_primary = float(depth_unit_scale_by_cam[cam_name])
 
             if rgb_primary is None or depth_primary is None or intr_primary is None or T_primary is None:
                 raise ValueError("Missing primary camera data")
 
+            tb["t_cameras_ms"] = (time.perf_counter() - t_cam0) * 1000.0
+
             if pw is not None and bool(pw.enabled):
                 ts_s = float(obs.t_client_send_ns) * 1e-9
+                t_pw0 = time.perf_counter()
                 try:
                     pw.push_and_maybe_build(
                         cameras=pw_cameras,
@@ -1068,39 +1154,115 @@ async def _handle_connection(
                         q=np.asarray(obs.q, dtype=np.float32),
                         gripper=float(obs.gripper),
                     )
+                    tb["t_pw_build_ms"] = (time.perf_counter() - t_pw0) * 1000.0
                     _maybe_dump_pointworld_acceptance(pointworld_obs=pw.last_pointworld_obs, step_id=int(obs.step_id))
-                except Exception:
+                except Exception as e:  # noqa: BLE001
+                    tb["t_pw_build_ms"] = (time.perf_counter() - t_pw0) * 1000.0
+                    tb["pw_build_error_type"] = type(e).__name__
+                    tb["pw_build_error_message"] = str(e)
                     pw.reset()
 
-            pcd_base = rgbd_to_pointcloud_base(
-                depth=np.asarray(depth_primary),
-                rgb=np.asarray(rgb_primary),
-                intr=intr_primary,
-                T_base_cam=T_primary,
-                depth_unit_scale=float(depth_unit_scale_primary),
-                depth_min_m=float(depth_min_m),
-                depth_max_m=float(depth_max_m),
-                stride=int(stride),
-                roi_min=None,
-                roi_max=None,
-                voxel_size_m=0.0,
-            )
+            t_pcd0 = time.perf_counter()
+            pcd_list: list[Dict[str, Any]] = []
+            for cam_name in REQUIRED_CAM_IDS:
+                pcd_i = rgbd_to_pointcloud_base(
+                    depth=np.asarray(pw_cameras[cam_name].depth),
+                    rgb=np.asarray(pw_cameras[cam_name].rgb),
+                    intr=intr_by_cam[cam_name],
+                    T_base_cam=T_by_cam[cam_name],
+                    depth_unit_scale=float(depth_unit_scale_by_cam.get(cam_name, depth_unit_scale_primary)),
+                    depth_min_m=float(depth_min_m),
+                    depth_max_m=float(depth_max_m),
+                    stride=int(stride),
+                    roi_min=None,
+                    roi_max=None,
+                    voxel_size_m=0.0,
+                )
+                pcd_list.append(dict(pcd_i))
+
+            pts_list = [np.asarray(p["points"], dtype=np.float32) for p in pcd_list if np.asarray(p["points"]).size > 0]
+            pts = np.concatenate(pts_list, axis=0) if pts_list else np.zeros((0, 3), dtype=np.float32)
+            out_pcd: Dict[str, Any] = {"points": np.ascontiguousarray(pts)}
+
+            if all("colors" in p for p in pcd_list):
+                col_list = [np.asarray(p["colors"], dtype=np.uint8) for p in pcd_list if np.asarray(p["points"]).size > 0]
+                cols = np.concatenate(col_list, axis=0) if col_list else np.zeros((0, 3), dtype=np.uint8)
+                out_pcd["colors"] = np.ascontiguousarray(cols)
+
+            pcd_base = out_pcd
+
+            try:
+                tb["pcd_points"] = int(np.asarray(pcd_base.get("points")).shape[0]) if isinstance(pcd_base, dict) and "points" in pcd_base else 0
+            except Exception:
+                tb["pcd_points"] = 0
+            tb["t_pcd_ms"] = (time.perf_counter() - t_pcd0) * 1000.0
 
             timing_policy = cfg.policy
+            t_solve0 = time.perf_counter()
             if cfg.policy == "dummy_hold":
                 actions = _make_actions_dummy_hold(obs.q, float(obs.gripper), cfg.open_loop_horizon)
             elif cfg.policy == "mppi_joint":
                 solver = _get_joint_solver(cfg.open_loop_horizon)
                 pw_obs = pw.last_pointworld_obs if (pw is not None and bool(pw.enabled)) else None
-                pw_cost_fn: Optional[PointWorldCostFn] = (
+
+                pw_cost_fn0: Optional[PointWorldCostFn] = (
                     pw.cost_model if (pw is not None and bool(pw.enabled) and pw.cost_model is not None) else None
                 )
+
+                pw_cost_error: Dict[str, Any] = {}
+
+                if pw_cost_fn0 is not None:
+
+                    def _wrapped_pw_cost_fn(*, q_traj: np.ndarray, u_traj: np.ndarray, pointworld_obs: dict[str, Any], gripper: Optional[float] = None):
+                        try:
+                            return pw_cost_fn0(
+                                q_traj=q_traj,
+                                u_traj=u_traj,
+                                pointworld_obs=pointworld_obs,
+                                gripper=gripper,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            import traceback
+
+                            pw_cost_error["type"] = type(e).__name__
+                            pw_cost_error["message"] = str(e)
+                            pw_cost_error["traceback"] = traceback.format_exc()
+                            raise
+
+                    pw_cost_fn: Optional[PointWorldCostFn] = _wrapped_pw_cost_fn
+                else:
+                    pw_cost_fn = None
+
                 actions = solver.infer_actions(
                     q0=obs.q,
                     gripper=float(obs.gripper),
                     pcd_back_cam=pcd_base,
                     pointworld_obs=pw_obs,
                     pointworld_cost_fn=pw_cost_fn,
+                )
+
+                tb["t_solver_ms"] = (time.perf_counter() - t_solve0) * 1000.0
+
+                pw_cost_debug: Dict[str, Any] = {
+                    "enabled": bool(getattr(solver, "last_pw_enabled", False)),
+                    "reason": str(getattr(solver, "last_pw_reason", "") or ""),
+                    "ms": float(getattr(solver, "last_pw_ms", 0.0) or 0.0),
+                }
+
+                if pw_cost_error:
+                    tb = str(pw_cost_error.get("traceback", "") or "")
+                    if len(tb) > 4000:
+                        tb = tb[-4000:]
+                    pw_cost_debug["error_type"] = str(pw_cost_error.get("type", "") or "")
+                    pw_cost_debug["error_message"] = str(pw_cost_error.get("message", "") or "")
+                    pw_cost_debug["error_traceback"] = tb
+
+                tb["pw_ms"] = float(pw_cost_debug.get("ms", 0.0) or 0.0)
+                _maybe_dump_pointworld_acceptance(
+                    pointworld_obs=pw_obs,
+                    step_id=int(obs.step_id),
+                    pw_cost_debug=pw_cost_debug,
+                    timing_breakdown=tb,
                 )
 
                 if _env_bool("MPPI_PCL_SAVE_PCD", "0") and getattr(solver, "cfg", None) is not None:
@@ -1220,7 +1382,20 @@ async def _handle_connection(
                 server_timing=timing,
             )
             resp = InferResponsePCL(request_id=request_id, action_chunk=chunk).to_envelope()
-            await ws.send(encode_message(resp))
+            t_enc0 = time.perf_counter()
+            payload_out = encode_message(resp)
+            tb["t_encode_ms"] = (time.perf_counter() - t_enc0) * 1000.0
+            await ws.send(payload_out)
+
+            if verbose and (n_req % print_every) == 0:
+                cams_payload = getattr(obs, "cameras", None)
+                cam_names = sorted(str(k) for k in cams_payload.keys()) if isinstance(cams_payload, dict) else []
+                n_pts = -1
+                try:
+                    n_pts = int(np.asarray(pcd_base.get("points")).shape[0]) if isinstance(pcd_base, dict) and "points" in pcd_base else -1
+                except Exception:
+                    n_pts = -1
+                print(f"[pcl_server] id={conn_id} step={int(obs.step_id)} req={request_id} cams={cam_names} points={n_pts} infer_ms={(t1 - t0) * 1000.0:.3f} policy={timing_policy}")
         except Exception as e:  # noqa: BLE001
             try:
                 request_id = str(envelope.get("request_id", "")) if "envelope" in locals() else ""
@@ -1240,16 +1415,28 @@ async def serve(cfg: ServerConfig) -> None:
     cam_configs = _load_cam_configs_from_env(cfg.cam_id)
     pw = _build_pointworld_runtime()
 
-    if cfg.cam_id not in cam_configs:
+    missing = [c for c in REQUIRED_CAM_IDS if str(c) not in cam_configs]
+    if missing:
+        name_list = ",".join(str(x) for x in missing)
         raise RuntimeError(
-            f"Missing cam config for cam_id={cfg.cam_id}. "
-            f"Set MPPI_PCL_CAM_INFO_{cfg.cam_id.upper()}_PATH and MPPI_PCL_T_BASE_CAM_{cfg.cam_id.upper()}_PATH."
+            f"Missing cam config(s): {name_list}. "
+            f"Set MPPI_PCL_CAM_INFO_<CAM>_PATH and MPPI_PCL_T_BASE_CAM_<CAM>_PATH for each, e.g. BACK/SIDE."
         )
+
+    verbose = _env_bool("MPPI_PCL_VERBOSE", "1")
+    if verbose:
+        pw_enabled = bool(pw is not None and bool(getattr(pw, "enabled", False)))
+        dump_dir = os.getenv("MPPI_PW_ACCEPTANCE_DUMP_DIR", "").strip()
+        print(f"[pcl_server] boot host={cfg.host} port={cfg.port} policy={cfg.policy} horizon={cfg.open_loop_horizon} cam_id={cfg.cam_id}")
+        print(f"[pcl_server] required_cams={list(REQUIRED_CAM_IDS)} loaded_cam_configs={sorted(cam_configs.keys())}")
+        print(f"[pcl_server] pointworld_enabled={pw_enabled} acceptance_dump_dir={dump_dir if dump_dir else 'disabled'}")
 
     async def handler(ws: Any) -> None:
         await _handle_connection(ws, cfg, cam_configs, pw)
 
     async with websockets.serve(handler, cfg.host, cfg.port, max_size=None):
+        if verbose:
+            print(f"[pcl_server] listening ws://{cfg.host}:{cfg.port}")
         await asyncio.Future()
 
 

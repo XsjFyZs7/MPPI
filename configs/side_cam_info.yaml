@@ -1,0 +1,55 @@
+image_width: 640
+image_height: 480
+camera_name: side_camera_info
+camera_matrix:
+  rows: 3
+  cols: 3
+  data:
+  - 397.4894714355469
+  - 0.0
+  - 325.1258239746094
+  - 0.0
+  - 397.4244079589844
+  - 242.16712951660156
+  - 0.0
+  - 0.0
+  - 1.0
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data:
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 0.0
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+projection_matrix:
+  rows: 3
+  cols: 4
+  data:
+  - 397.4894714355469
+  - 0.0
+  - 325.1258239746094
+  - 0.0
+  - 0.0
+  - 397.4244079589844
+  - 242.16712951660156
+  - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+  - 0.0

@@ -98,15 +98,90 @@ def _resolve_asset_path(*, json_path: str, data_root: str, rel_or_abs: str) -> s
     return str(candidates[0])
 
 
-def _extract_q(obj: Dict[str, Any]) -> List[float]:
-    if isinstance(obj, dict) and "/franka/joint_states" in obj:
-        js = obj["/franka/joint_states"]
-        if isinstance(js, dict) and isinstance(js.get("position"), list) and len(js["position"]) == 7:
-            return [float(x) for x in js["position"]]
-    for key in ("joint_positions", "q", "qpos"):
-        if isinstance(obj, dict) and isinstance(obj.get(key), list) and len(obj[key]) == 7:
-            return [float(x) for x in obj[key]]
-    raise ValueError("Missing joint positions with len=7")
+def _as_q_list(v: Any) -> Optional[List[float]]:
+    if isinstance(v, np.ndarray):
+        v = v.tolist()
+    if isinstance(v, (list, tuple)) and len(v) == 7:
+        try:
+            return [float(x) for x in v]
+        except Exception:
+            return None
+    return None
+
+
+def _extract_q(obj: Any) -> List[float]:
+    q0 = _as_q_list(obj)
+    if q0 is not None:
+        return q0
+
+    if not isinstance(obj, dict):
+        raise ValueError(f"Missing joint positions with len=7 (type={type(obj).__name__})")
+
+    js_candidates = []
+    for k in ("/franka/joint_states", "joint_states", "joint_state", "franka_joint_states"):
+        if k in obj:
+            js_candidates.append(obj.get(k))
+
+    for js in js_candidates:
+        if isinstance(js, dict):
+            q1 = _as_q_list(js.get("position"))
+            if q1 is not None:
+                return q1
+
+    for key in (
+        "joint_positions",
+        "q",
+        "qpos",
+        "q0",
+        "jp",
+        "joint_pos",
+        "positions",
+    ):
+        q2 = _as_q_list(obj.get(key))
+        if q2 is not None:
+            return q2
+
+    for key in ("obs", "observation", "state", "robot", "robot_state", "proprio", "proprioception"):
+        if key in obj:
+            try:
+                return _extract_q(obj.get(key))
+            except Exception:
+                pass
+
+    for k, v in obj.items():
+        ks = str(k).lower()
+        if ("joint" in ks or ks in {"q", "qpos", "jp"}) and _as_q_list(v) is not None:
+            return _as_q_list(v) or [0.0] * 7
+        if isinstance(v, dict) and ("joint" in ks or "state" in ks or "obs" in ks):
+            try:
+                return _extract_q(v)
+            except Exception:
+                pass
+
+    visited: set[int] = set()
+    stack: list[tuple[Any, int]] = [(obj, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        if id(cur) in visited:
+            continue
+        visited.add(id(cur))
+
+        qx = _as_q_list(cur)
+        if qx is not None:
+            return qx
+
+        if depth >= 4:
+            continue
+
+        if isinstance(cur, dict):
+            for vv in cur.values():
+                stack.append((vv, depth + 1))
+        elif isinstance(cur, (list, tuple)):
+            for vv in cur:
+                stack.append((vv, depth + 1))
+
+    keys = sorted(str(k) for k in obj.keys())
+    raise ValueError(f"Missing joint positions with len=7. Top-level keys={keys[:50]}")
 
 
 def _extract_step_id(obj: Dict[str, Any], fallback: int) -> int:
@@ -128,7 +203,42 @@ def _load_episode_items(episode_dir: str) -> List[Dict[str, Any]]:
     steps = pickle.load(open(ep / "data.pkl", "rb"))
     if not isinstance(steps, list) or not steps:
         raise ValueError("data.pkl must be a non-empty list")
-    return [dict(x) if isinstance(x, dict) else {"frame_id": i, "q": list(x)} for i, x in enumerate(steps)]
+
+    out: List[Dict[str, Any]] = []
+    for i, x in enumerate(steps):
+        if isinstance(x, dict):
+            d = dict(x)
+            d.setdefault("frame_id", i)
+            out.append(d)
+            continue
+
+        if isinstance(x, np.ndarray):
+            x = x.tolist()
+
+        if isinstance(x, (list, tuple)):
+            q = _as_q_list(x)
+            if q is not None:
+                out.append({"frame_id": i, "q": q})
+                continue
+            for vv in x:
+                q2 = _as_q_list(vv)
+                if q2 is not None:
+                    out.append({"frame_id": i, "q": q2})
+                    break
+            else:
+                out.append({"frame_id": i, "_step": x})
+            continue
+
+        dd = getattr(x, "__dict__", None)
+        if isinstance(dd, dict):
+            d = dict(dd)
+            d.setdefault("frame_id", i)
+            out.append(d)
+            continue
+
+        out.append({"frame_id": i, "_step": x})
+
+    return out
 
 
 def _find_rgb_with_stem(rgb_dir: Path, stem: str) -> str:
