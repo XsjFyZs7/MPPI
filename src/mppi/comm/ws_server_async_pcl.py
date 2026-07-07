@@ -985,6 +985,11 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
                 cost=cost_cfg,
             )
         )
+        print(
+            "[pcl_server] pointworld_cost_devices="
+            f"{','.join(cost_model._devices)} robot_devices={','.join(cost_model._robot_devices)} "
+            f"replicas={len(cost_model._replicas)} eval_batch_size={cost_model.cfg.eval_batch_size}"
+        )
 
     rt = _PointWorldRuntime(
         cfg=cfg,

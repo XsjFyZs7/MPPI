@@ -81,6 +81,9 @@ class CoTrackerOnlinePointTracker(OnlinePointTracker):
         window_len: int = 16,
         device: Optional[str] = None,
         v2: bool = False,
+        iters: int = 6,
+        use_model_path: bool = True,
+        vis_thr: float = 0.6,
     ) -> None:
         torch = _require_torch()
 
@@ -108,6 +111,9 @@ class CoTrackerOnlinePointTracker(OnlinePointTracker):
         self._predictor = predictor.to(device)
         self._device = str(device)
         self._model_window_len = int(model_window_len)
+        self._iters = int(iters)
+        self._use_model_path = bool(use_model_path)
+        self._vis_thr = float(vis_thr)
 
     def track_window(self, frames: Union[np.ndarray, Sequence[np.ndarray]], query_points: np.ndarray) -> TrackWindowOutput:
         torch = self._torch

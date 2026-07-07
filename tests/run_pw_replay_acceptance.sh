@@ -23,6 +23,7 @@ PRIMARY_CAM_ID="${PRIMARY_CAM_ID:-back}"
 SERVER_WAIT_S="${SERVER_WAIT_S:-0}"
 SERVER_WAIT_TIMEOUT_S="${SERVER_WAIT_TIMEOUT_S:-180}"
 SERVER_WAIT_INTERVAL_S="${SERVER_WAIT_INTERVAL_S:-0.5}"
+PW_MULTI_GPU_DEVICES="${MPPI_PW_MULTI_GPU_DEVICES:-}"
 
 OUT_ROOT="${OUT_ROOT:-${REPO_ROOT}/data/pw_acceptance/${PROFILE}}"
 ACCEPT_DIR="${MPPI_PW_ACCEPTANCE_DUMP_DIR:-${OUT_ROOT}/server}"
@@ -96,6 +97,10 @@ run_server() {
   export MPPI_PW_MODEL_DEVICE="${MPPI_PW_MODEL_DEVICE:-cuda:0}"
   export MPPI_PW_COTRACKER_DEVICE="${MPPI_PW_COTRACKER_DEVICE:-cuda:0}"
   export MPPI_PW_ROBOT_SAMPLER_DEVICE="${MPPI_PW_ROBOT_SAMPLER_DEVICE:-${MPPI_PW_MODEL_DEVICE}}"
+  if [[ -n "${PW_MULTI_GPU_DEVICES}" ]]; then
+    export MPPI_PW_MODEL_DEVICE="${PW_MULTI_GPU_DEVICES}"
+    export MPPI_PW_ROBOT_SAMPLER_DEVICE="${PW_MULTI_GPU_DEVICES}"
+  fi
   export MPPI_PW_MODEL_DOMAIN="${MPPI_PW_MODEL_DOMAIN:-droid}"
 
   export MPPI_URDF_PATH="${MPPI_URDF_PATH:-${POINTWORLD_ROOT}/assets/franka_description/franka_panda_robotiq_2f85.urdf}"
@@ -111,6 +116,9 @@ run_server() {
     ln -sf /home/models/DINOv3/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth \
       "${DINOv3_ROOT}/checkpoints/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth" || true
   fi
+
+  echo "[acceptance] pw_model_device=${MPPI_PW_MODEL_DEVICE}"
+  echo "[acceptance] pw_robot_sampler_device=${MPPI_PW_ROBOT_SAMPLER_DEVICE}"
 
   python3 -u -m mppi.comm.ws_server_async_pcl \
     --host 0.0.0.0 \
