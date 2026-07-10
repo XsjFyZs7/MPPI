@@ -95,7 +95,7 @@ python3 -m mppi.comm.ws_client_sync_pcl \
 
 ## Stage 2：本地回放验收（收口 PASS/FAIL）
 
-### 2.1 一键：server + replay + acceptance（原生 episode，双视角）
+### 2.1 两终端：server + replay + acceptance（原生 episode，双视角）
 调试：PointWorld window/tracking + 关键字段稳定产出
 
 episode 目录结构（与 Terminal#133-134 对齐）：
@@ -103,10 +103,20 @@ episode 目录结构（与 Terminal#133-134 对齐）：
 - `side/` + `side_depth/`
 - `data.pkl`
 
+Terminal A（起 server，保持常驻）：
+```bash
+cd /home/wangyuhan/MPPI
+bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh server obs_infl
+```
+
+Terminal B（跑 replay + acceptance，收口 PASS/FAIL）：
 ```bash
 EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
 DUAL_VIEW=1 \
-bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh all obs_infl
+START_IDX=0 \
+MAX_STEPS=16 \
+REQUEST_TIMEOUT_S=120 \
+bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl
 ```
 
 预期：最后输出 `FINAL: PASS`。
@@ -148,6 +158,7 @@ DUAL_VIEW=1 \
 URL=ws://<CLOUD_IP>:9011 \
 START_IDX=0 \
 MAX_STEPS=8 \
+REQUEST_TIMEOUT_S=120 \
 bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl
 ```
 
@@ -187,6 +198,7 @@ EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
 DUAL_VIEW=1 \
 START_IDX=10 \
 MAX_STEPS=12 \
+REQUEST_TIMEOUT_S=120 \
 bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl
 ```
 
@@ -204,6 +216,7 @@ for NS in 1024 512 256; do
   DUAL_VIEW=1 \
   START_IDX=10 \
   MAX_STEPS=12 \
+  REQUEST_TIMEOUT_S=120 \
   MPPI_PW_MAX_SCENE_POINTS=${NS} \
   bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl || exit 1
   echo ""
@@ -224,6 +237,7 @@ for BS in 32 16 8; do
   DUAL_VIEW=1 \
   START_IDX=10 \
   MAX_STEPS=12 \
+  REQUEST_TIMEOUT_S=120 \
   MPPI_PW_EVAL_BATCH_SIZE=${BS} \
   bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl || exit 1
   echo ""
@@ -241,6 +255,7 @@ EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
 DUAL_VIEW=1 \
 START_IDX=10 \
 MAX_STEPS=12 \
+REQUEST_TIMEOUT_S=120 \
 MPPI_PW_USE_MODEL_CONFIDENCE=1 \
 MPPI_PW_USE_TRACK_CONFIDENCE=1 \
 bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl
@@ -251,6 +266,7 @@ EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
 DUAL_VIEW=1 \
 START_IDX=10 \
 MAX_STEPS=12 \
+REQUEST_TIMEOUT_S=120 \
 MPPI_PW_USE_MODEL_CONFIDENCE=0 \
 MPPI_PW_USE_TRACK_CONFIDENCE=0 \
 bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl
@@ -295,6 +311,7 @@ for K in 256 128 64; do
   echo "== K=${K} =="
   EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
   DUAL_VIEW=1 START_IDX=10 MAX_STEPS=12 \
+  REQUEST_TIMEOUT_S=120 \
   MPPI_NUM_SAMPLES=${K} \
   bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl || exit 1
   echo ""
@@ -309,6 +326,7 @@ for NS in 1024 512 256 128; do
   echo "== Ns=${NS} =="
   EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
   DUAL_VIEW=1 START_IDX=10 MAX_STEPS=12 \
+  REQUEST_TIMEOUT_S=120 \
   MPPI_PW_MAX_SCENE_POINTS=${NS} \
   bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl || exit 1
   echo ""
@@ -323,6 +341,7 @@ for Q in 2048 1024 512 256; do
   echo "== Q_per_cam=${Q} =="
   EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
   DUAL_VIEW=1 START_IDX=10 MAX_STEPS=12 \
+  REQUEST_TIMEOUT_S=120 \
   MPPI_PW_MAX_QUERY_POINTS_PER_CAMERA=${Q} \
   bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl || exit 1
   echo ""
@@ -337,6 +356,7 @@ for NR in 256 128 64 32; do
   echo "== Nr=${NR} =="
   EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
   DUAL_VIEW=1 START_IDX=10 MAX_STEPS=12 \
+  REQUEST_TIMEOUT_S=120 \
   MPPI_PW_MAX_ROBOT_POINTS=${NR} \
   bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl || exit 1
   echo ""
@@ -346,23 +366,136 @@ done
 补充（吞吐 sweet spot）：继续沿用 4.3 的 `MPPI_PW_EVAL_BATCH_SIZE` 扫参，并可以额外试 `64`（显存够的话）。
 
 #### 4.6.2 需要改代码的加速（如果目标是在线闭环，就要动这里）
-A) `t_pw_build_ms`：给 CoTracker 加 “iters/分辨率/fast path” 可调开关
-- 现状：`CoTrackerOnlinePointTracker.track_window()` 固定 `iters=6`，且走 `pred.model(...)` 路径
-- 建议：支持通过 env 调参（例如 `MPPI_PW_COTRACKER_ITERS=3/4/6`），并评估是否可以仅用 predictor 的输出（牺牲少量质量换大幅提速）
 
-B) `pw_ms`：`dist2robot` 是确定的重算（`flows.py: build_scene_features_torch`）
-- 现状：每帧每个 t 都做一次 `torch.cdist(p0, robot_t)`（还按 Ns 分块循环），对 `B=K` 很重
-- 建议：提供可切换的近似模式（用于在线）
-  - `dist2robot=t0_repeat`：只算 t=0 的 dist2robot，然后沿 T 维 repeat
-  - `dist2robot=none`：直接置零（用于上限测速/排除项）
+目标：把离线回放里稳定暴露出来的两块重成本，变成“可控可降级”的在线可用版本。
 
-C) `pw_ms`：开启/验证 `torch.compile`
-- 现状：`PointWorldModelConfig.disable_compile` 默认 True（env `MPPI_PW_DISABLE_COMPILE` 默认 1）
-- 建议：在离线回放里打开 compile（`MPPI_PW_DISABLE_COMPILE=0`），允许首帧编译慢，但看稳定段是否显著降 `pw_ms`
+落地顺序建议（先快收益、再做并行）：
+1) B：`dist2robot=t0_repeat`（最直接砍 `pw_ms`，实现面最小、收益最大）
+2) A：CoTracker iters/分辨率/fast path（直接砍 `t_pw_build_ms`）
+3) D：多 GPU 并行（有多卡时分摊 `K`，进一步砍 `pw_ms`）
 
-D) 多 GPU 并行（有多卡时）
-- 现状：`PointWorldCostModel` 支持 `device="cuda:0,cuda:1"` 多 replica 并行（线程池分片 B 维）
-- 建议：如果云端有两张卡，直接用多 device 分摊 `K` 的 cost 计算
+---
+
+### A) `t_pw_build_ms`：CoTracker 加 iters/分辨率/fast path 可调开关
+
+为什么慢（功能与成本来源）：
+- PW build 需要在 window=11 的时序上，对双视角 query points 做跨帧跟踪（CoTracker），并在每帧做 2D→3D 回投与过滤融合；跟踪网络推理 + 多帧处理是主要成本。
+
+改哪些代码（建议最小改动面）：
+- `src/mppi/pointworld_ext/tracker_interface.py`（核心）：`CoTrackerOnlinePointTracker.track_window()`
+- （可选）`src/mppi/pointworld_ext/scene_flow_builder.py`（若把缩放/坐标变换放到 build 侧做）
+
+新逻辑应该是什么样（建议的开关与语义）：
+- `MPPI_PW_COTRACKER_ITERS`：默认 6，可取 3/4/6；控制跟踪迭代次数
+- `MPPI_PW_COTRACKER_FAST_PATH`：默认 0；=1 时尽量走更轻的 predictor 输出路径，避免重路径（以“质量换速度”）
+- `MPPI_PW_COTRACKER_TRACK_HW`（或 `..._TRACK_SCALE`）：默认不缩放；设置后将 tracking 输入帧与 query points 缩放到更小分辨率跟踪，并把输出 uv_tracks 缩放回 contract 分辨率用于深度回投
+
+风险与验收口径：
+- 风险：iters/分辨率下降会降低跟踪质量，导致 `scene_exists` 稀疏、task 点数减少，进而影响 cost 稳定性/有效性，但不应 crash。
+- 验收：
+  - window ready 后仍稳定产出 `scene_flows/scene_exists/scene_visibility/scene_depth_valid_mask`
+  - `task_n_obs/task_n_infl` 不长期为 0（除非确实不命中 AABB）
+  - `timing_breakdown.t_pw_build_ms` 相比 baseline 明显下降
+
+A 补充：robot mask 优化待办（表格版）
+
+| 条目 | 改哪些代码 | 为什么 | 新逻辑应该是什么样 | 验收口径 |
+|---|---|---|---|---|
+| 去掉 per-point `cv2.circle` 循环 | `src/mppi/pointworld_ext/scene_flow_builder.py` 中 `_RobotMask2DBuilder.build_mask()` | 当前对每个投影点逐个 `cv2.circle` 是 Python 热点；step10 已看到 `ms_robot_mask0/ms_shift_robot_mask` 单次 ~0.4–0.55s | 先把投影点一次性栅格化到二值 mask，再用 `cv2.dilate` / `cv2.morphologyEx` 做膨胀与闭运算；不再逐点画圆 | `ms_robot_mask0/ms_shift_robot_mask` 明显下降；mask 形状/类型不变；query gating 不崩 |
+| FK / mesh->world 对双视角共享 | `src/mppi/pointworld_ext/scene_flow_builder.py`；围绕 `_RobotMask2DBuilder` 增加“按时间点缓存 world points/FK 结果”的接口 | 当前 back/side 在同一时间点重复做 `visual_trimesh_fk + pts_local -> pts_world`，双视角重复计算 | 对 `t=0` 只算一次 FK/world points，供 back/side 共用；对 `t=shift` 也只算一次；每个相机只做投影与栅格化 | 双视角下 FK/world transform 相关耗时至少减半；`ms_robot_mask0/ms_shift_robot_mask` 同步下降 |
+| shift mask 降频更新 | `src/mppi/pointworld_ext/scene_flow_builder.py` 中生成 `shift_robot_mask` 的位置 | 当前每帧每相机都算 `robot_mask0 + shift_robot_mask`，双视角共 4 次/帧，是 build 大头 | 新增开关（如 `MPPI_PW_SHIFT_MASK_UPDATE_EVERY`）；`robot_mask0` 保持每帧更新，`shift_robot_mask` 每 N 帧更新一次，其余帧复用缓存 | mask 调用次数从 4 次/帧降到约 2 次/帧；`t_pw_build_ms` 明显下降；稳定段 `task_n_obs/task_n_infl` 不显著恶化 |
+| 缓存键与失效规则 | 同上 | 共享 FK/world points 与 shift mask 复用后，如果缓存失效规则不严，容易用错数据 | 缓存键至少覆盖：时间点（t0/shift）、相机分辨率、intrinsics/world2cam、seed；任何配置变化时强制失效 | 不出现“旧 mask 污染新帧”的异常；切 profile/改分辨率后行为正常 |
+| timing 验证补强 | `src/mppi/pointworld_ext/scene_flow_builder.py` | 需要量化三项优化分别贡献多少收益，避免只看总时延 | 增加 `ms_fk_world_shared_*`、`ms_project_mask*`、`ms_rasterize_mask*`、`ms_morph_mask*`、`shift_mask_cache_hit/miss` 等字段 | 能直接从 acceptance json 看出收益来源，便于做 A/B test |
+
+A 补充：shift mask 降频更新（仅验证 `update_every=2`）测试命令
+
+- Terminal A（起 server，开启 shift mask 降频更新）：
+
+```bash
+cd /home/wangyuhan/MPPI
+MPPI_PW_SHIFT_MASK_UPDATE_EVERY=2 \
+bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh server obs_infl
+```
+
+- Terminal B（固定在 window ready 段，观察 build 侧收益）：
+
+```bash
+EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
+DUAL_VIEW=1 \
+START_IDX=10 \
+MAX_STEPS=12 \
+REQUEST_TIMEOUT_S=120 \
+bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl
+```
+
+- 重点看 `data/pw_acceptance/obs_infl/server/*.json`：
+  - `timing_breakdown.t_pw_build_ms`
+  - `timing_breakdown.pw_build_breakdown.scene_build_breakdown.cams.<back|side>.ms_shift_robot_mask`
+  - `task_n_obs / task_n_infl`
+
+---
+
+### B) `pw_ms`：`dist2robot` 近似模式（用于在线降本）
+
+为什么慢（功能与成本来源）：
+- `dist2robot` 特征会把“场景点到机器人点云的最近距离”编码进模型输入。
+- 当前按时间步逐帧计算（每个 t 一次），并且对 MPPI 的每条候选轨迹（`B=K`）都计算，属于确定性重算。
+
+改哪些代码（建议最小改动面）：
+- `src/mppi/pointworld_ext/flows.py`：`build_scene_features_torch()`（必须）
+- `src/mppi/pointworld_ext/flows.py`：`build_scene_features()`（建议同步，避免 torch/numpy 行为漂移）
+
+新逻辑应该是什么样（保持模型输入维度不变）：
+- 仅实现并强制启用 `t0_repeat`：只计算 t=0 的 dist2robot，然后沿 T 维 repeat 生成同 shape 的特征（把 T 次重算变成 1 次）。
+- 强制离线/线上统一走 torch 特征构造（避免 torch/numpy 行为漂移）。
+
+方案 B 优化后（t0_repeat）建议的对比测试命令：
+- Terminal A（起 server，保持配置不变，用于和 baseline 对比）：
+
+```bash
+cd /home/wangyuhan/MPPI
+bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh server obs_infl
+```
+
+- Terminal B（固定在 window ready 段对比 `pw_ms`）：
+
+```bash
+EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
+DUAL_VIEW=1 \
+START_IDX=10 \
+MAX_STEPS=12 \
+REQUEST_TIMEOUT_S=120 \
+bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh replay obs_infl
+```
+
+风险与验收口径：
+- 风险：特征语义变化会影响策略质量，但应该保持数值稳定与不崩溃。
+- 验收：
+  - `pw_ms` 显著下降（尤其 `t0_repeat`）
+  - cost 输出全 finite、无 shape/contract 错误
+  - solver 仍稳定回包（可接受动作质量下降）
+
+---
+
+### D) 多 GPU 并行（有多卡时分摊 `K`）
+
+为什么能加速：
+- PointWorld cost 的计算主要沿 batch 维（`B=K` 候选轨迹）独立；多 GPU 可以把 `K` 分片到多个 replica 并行计算，再汇总回 CPU。
+
+改哪些代码：
+- 理想情况无需改代码：直接通过 env 把 model device 配成多卡（例如 `cuda:0,cuda:1`）。
+- 为了可验收与防踩坑，建议补强：
+  - 将“实际使用的设备列表/分片策略”写入 server 落盘摘要（复现实验时一眼确认是否生效）
+  - 若检测到不合法 device 字符串（例如 `cuda` 不带 index），直接 fail-fast
+
+建议的部署形态（减少 GPU 争抢）：
+- CoTracker 与 cost 分离到不同卡：
+  - `MPPI_PW_COTRACKER_DEVICE=cuda:0`
+  - `MPPI_PW_MODEL_DEVICE=cuda:1,cuda:2`（视机器卡数而定）
+  - `MPPI_PW_ROBOT_SAMPLER_DEVICE` 视情况跟随 model device 或固定到其中一张卡
+
+验收口径：
+- `pw_ms` 相比单卡下降，且能观察到多卡同时有负载；server 摘要里能核对到多 device 生效。
 
 ---
 

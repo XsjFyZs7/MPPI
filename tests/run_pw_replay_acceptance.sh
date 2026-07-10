@@ -38,6 +38,7 @@ MAX_STEPS="${MAX_STEPS:-16}"
 SLEEP_S="${SLEEP_S:-0.0}"
 GRIPPER="${GRIPPER:-0.0}"
 DEPTH_UNIT_SCALE="${DEPTH_UNIT_SCALE:-1.0}"
+REQUEST_TIMEOUT_S="${REQUEST_TIMEOUT_S:-10}"
 
 mkdir -p "${OUT_ROOT}"
 rm -rf "${ACCEPT_DIR}"
@@ -179,6 +180,7 @@ run_replay() {
     --sleep-s "${SLEEP_S}"
     --gripper "${GRIPPER}"
     --depth-unit-scale "${DEPTH_UNIT_SCALE}"
+    --request-timeout-s "${REQUEST_TIMEOUT_S}"
     --report-json "${REPORT_JSON}"
   )
 

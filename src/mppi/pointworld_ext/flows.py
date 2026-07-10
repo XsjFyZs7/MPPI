@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import Optional
 
 import numpy as np
@@ -289,35 +290,17 @@ def build_scene_features(
     robot_flows: np.ndarray,
     robot_exists: np.ndarray | None = None,
 ) -> np.ndarray:
-    flows = np.asarray(scene_flows, dtype=np.float32)
-    colors = np.asarray(scene_colors, dtype=np.float32)
-    gripper = np.asarray(gripper_positions, dtype=np.float32)
-    robot = np.asarray(robot_flows, dtype=np.float32)
-    exists = (np.asarray(robot_exists, dtype=bool) if robot_exists is not None else (np.linalg.norm(robot, axis=-1) > 0.0))
-    if flows.ndim != 4 or flows.shape[-1] != 3:
-        raise ValueError(f"scene_flows must be (B,T,N,3), got {flows.shape}")
-    if colors.shape != flows.shape:
-        raise ValueError(f"scene_colors must match scene_flows shape, got {colors.shape} vs {flows.shape}")
-    if gripper.shape != flows.shape[:2]:
-        raise ValueError(f"gripper_positions shape {gripper.shape} must match scene_flows[:2]={flows.shape[:2]}")
-    if robot.shape[:2] != flows.shape[:2] or robot.shape[-1] != 3:
-        raise ValueError(f"robot_flows must be (B,T,Nr,3) with matching (B,T), got {robot.shape}")
-    B, T, Ns, _ = flows.shape
-    p0 = flows[:, 0]
-    dist2robot = np.empty((B, 1, Ns, T), dtype=np.float32)
-    for t in range(T):
-        diff = p0[:, :, None, :] - robot[:, t, None, :, :]
-        d = np.linalg.norm(diff, axis=-1)
-        d = np.where(exists[:, t, None, :], d, np.inf)
-        dist2robot[:, 0, :, t] = np.min(d, axis=-1)
-    normals0 = np.zeros((B, 1, Ns, 3), dtype=np.float32)
-    flow0 = flows[:, :1]
-    color0 = colors[:, :1]
-    gripper_ctx = np.repeat(gripper[:, None, None, :], Ns, axis=2).astype(np.float32)
-    return np.concatenate([flow0, color0, normals0, gripper_ctx, dist2robot], axis=-1).astype(np.float32)
+    feat_t = build_scene_features_torch(
+        scene_flows=scene_flows,
+        scene_colors=scene_colors,
+        gripper_positions=gripper_positions,
+        robot_flows=robot_flows,
+        robot_exists=robot_exists,
+    )
+    return feat_t.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
-def build_scene_features_torch(*, scene_flows, scene_colors, gripper_positions, robot_flows, robot_exists=None):
+def build_scene_features_torch(*, scene_flows, scene_colors, gripper_positions, robot_flows, robot_exists=None, return_timing: bool = False):
     try:
         import torch
     except Exception as e:  # noqa: BLE001
@@ -335,21 +318,46 @@ def build_scene_features_torch(*, scene_flows, scene_colors, gripper_positions, 
         raise ValueError(f"gripper_positions shape {tuple(gripper.shape)} must match scene_flows[:2]={tuple(flows.shape[:2])}")
     if robot.ndim != 4 or tuple(robot.shape[:2]) != tuple(flows.shape[:2]) or int(robot.shape[-1]) != 3:
         raise ValueError(f"robot_flows must be (B,T,Nr,3) with matching (B,T), got {tuple(robot.shape)}")
-    B, T, Ns, _ = flows.shape
+    t0 = time.perf_counter()
+
+    B = int(flows.shape[0])
+    T = int(flows.shape[1])
+    Ns = int(flows.shape[2])
+
     p0 = flows[:, 0]
-    dist2robot = torch.empty((B, 1, Ns, T), device=flows.device, dtype=torch.float32)
-    for t in range(T):
-        pts = robot[:, t]
-        valid = exists[:, t]
-        out_t = torch.empty((B, Ns), device=flows.device, dtype=torch.float32)
-        for s in range(0, Ns, 256):
-            e = min(s + 256, Ns)
-            d = torch.cdist(p0[:, s:e], pts)
-            d = d.masked_fill(~valid[:, None, :], float("inf"))
-            out_t[:, s:e] = d.min(dim=-1).values
-        dist2robot[:, 0, :, t] = out_t
+    pts0 = robot[:, 0]
+    valid0 = exists[:, 0]
+
+    t_d20 = time.perf_counter()
+    block = 256
+    out0 = torch.empty((B, Ns), device=flows.device, dtype=torch.float32)
+    for s in range(0, Ns, block):
+        e = min(s + block, Ns)
+        d = torch.cdist(p0[:, s:e], pts0)
+        d = d.masked_fill(~valid0[:, None, :], float("inf"))
+        out0[:, s:e] = d.min(dim=-1).values
+
+    dist2robot = out0[:, None, :, None].expand(B, 1, Ns, T)
+    t_dist2robot_ms = (time.perf_counter() - t_d20) * 1000.0
+
     normals0 = torch.zeros((B, 1, Ns, 3), device=flows.device, dtype=torch.float32)
     flow0 = flows[:, :1]
     color0 = colors[:, :1]
     gripper_ctx = gripper[:, None, None, :].expand(B, 1, Ns, T)
-    return torch.cat([flow0, color0, normals0, gripper_ctx, dist2robot], dim=-1).to(dtype=torch.float32)
+    feat = torch.cat([flow0, color0, normals0, gripper_ctx, dist2robot], dim=-1).to(dtype=torch.float32)
+
+    if not bool(return_timing):
+        return feat
+
+    timing = {
+        "dist2robot_mode": "t0_expand",
+        "t_dist2robot_ms": float(t_dist2robot_ms),
+        "t_total_ms": float((time.perf_counter() - t0) * 1000.0),
+        "block": int(block),
+        "B": int(B),
+        "T": int(T),
+        "Ns": int(Ns),
+        "Nr": int(robot.shape[2]),
+        "device": str(feat.device),
+    }
+    return feat, timing

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
+import time
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -61,6 +63,11 @@ def _as_spheres_array(spheres: Sequence[Tuple[float, float, float, float]]) -> n
     if s.ndim != 2 or s.shape[1] != 4:
         raise ValueError(f"Expected spheres shape (M,4), got {s.shape}")
     return s
+
+
+def _stable_sig(x: np.ndarray | Sequence[float] | object) -> bytes:
+    a = np.asarray(x, dtype=np.float32)
+    return np.ascontiguousarray(np.round(a, 6)).tobytes()
 
 
 def _require_cv2():
@@ -190,6 +197,47 @@ class _RobotMask2DBuilder:
         self._mesh_presampled_points: Dict[str, np.ndarray] = {}
         self._last_seed: Optional[int] = None
 
+    def build_world_points(
+        self,
+        *,
+        joint_positions: np.ndarray,
+        gripper_positions: np.ndarray,
+        seed: Optional[int],
+    ) -> Dict[str, np.ndarray]:
+        fk_result = self._urdf_helper.visual_trimesh_fk(joint_positions=joint_positions, gripper_positions=gripper_positions)
+        if (not self._ready) or (self._last_seed != seed):
+            self._presample_mesh_points(fk_result, seed=seed)
+
+        gripper_keywords = ["finger", "knuckle", "robotiq"]
+        out: Dict[str, np.ndarray] = {"standard": [], "gripper": []}
+        for i, mesh in enumerate(fk_result.keys()):
+            mesh_name = _get_mesh_stable_id(mesh, i)
+            if float(getattr(mesh, "area", 0.0)) <= 0.0:
+                continue
+            pts_local = self._mesh_presampled_points.get(mesh_name)
+            if pts_local is None or pts_local.size == 0:
+                continue
+            T_wm = np.asarray(fk_result[mesh], dtype=np.float32)
+            pts_world = transform_points(T_wm, pts_local)
+            key = "gripper" if any(k in mesh_name.lower() for k in gripper_keywords) else "standard"
+            out[key].append(np.asarray(pts_world, dtype=np.float32))
+
+        return {
+            "standard": np.concatenate(out["standard"], axis=0).astype(np.float32) if out["standard"] else np.zeros((0, 3), dtype=np.float32),
+            "gripper": np.concatenate(out["gripper"], axis=0).astype(np.float32) if out["gripper"] else np.zeros((0, 3), dtype=np.float32),
+        }
+
+    def project_world_points_to_mask(
+        self,
+        *,
+        world_points: Dict[str, np.ndarray],
+        intr: PinholeIntrinsics,
+        world2cam: np.ndarray,
+        height: int,
+        width: int,
+    ) -> np.ndarray:
+        cv2 = _require_cv2()
+
     def _presample_mesh_points(self, fk_result: Dict[object, np.ndarray], *, seed: Optional[int]) -> None:
         _require_trimesh_urdfpy()
         import trimesh
@@ -252,55 +300,51 @@ class _RobotMask2DBuilder:
         gripper_positions: np.ndarray,
         seed: Optional[int],
     ) -> np.ndarray:
-        cv2 = _require_cv2()
+        world_points = self.build_world_points(
+            joint_positions=joint_positions,
+            gripper_positions=gripper_positions,
+            seed=seed,
+        )
+        return self.project_world_points_to_mask(
+            world_points=world_points,
+            intr=intr,
+            world2cam=world2cam,
+            height=height,
+            width=width,
+        )
 
-        fk_result = self._urdf_helper.visual_trimesh_fk(joint_positions=joint_positions, gripper_positions=gripper_positions)
-        if (not self._ready) or (self._last_seed != seed):
-            self._presample_mesh_points(fk_result, seed=seed)
-
-        H = int(height)
-        W = int(width)
-        robot_mask = np.zeros((H, W), dtype=np.uint8)
-
-        ref_H, ref_W = 180.0, 320.0
-        scale = min(float(H) / ref_H, float(W) / ref_W)
-        if not np.isfinite(scale) or scale <= 0.0:
-            scale = 1.0
-
-        standard_circle_radius = max(1, int(round(30.0 * scale)))
-        gripper_circle_radius = max(1, int(round(20.0 * scale)))
-
-        kernel_size = max(3, int(round(30.0 * scale)))
-        if (kernel_size % 2) == 0:
-            kernel_size += 1
-
-        gripper_keywords = ["finger", "knuckle", "robotiq"]
-
-        for i, mesh in enumerate(fk_result.keys()):
-            mesh_name = _get_mesh_stable_id(mesh, i)
-            if float(getattr(mesh, "area", 0.0)) <= 0.0:
-                continue
-            pts_local = self._mesh_presampled_points.get(mesh_name)
-            if pts_local is None or pts_local.size == 0:
-                continue
-
-            is_gripper_part = any(k in mesh_name.lower() for k in gripper_keywords)
-            circle_radius = gripper_circle_radius if is_gripper_part else standard_circle_radius
-
-            T_wm = np.asarray(fk_result[mesh], dtype=np.float32)
-            pts_world = transform_points(T_wm, pts_local)
-            uv, okz = project_points_to_pixels(pts_world, world2cam=world2cam, intr=intr)
-            if uv.shape[0] == 0:
-                continue
-            uv = np.round(uv[okz]).astype(np.int32)
-
-            for (x, y) in uv:
-                if 0 <= x < W and 0 <= y < H:
-                    cv2.circle(robot_mask, (int(x), int(y)), int(circle_radius), color=1, thickness=-1)
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(kernel_size), int(kernel_size)))
-        robot_mask = cv2.morphologyEx(robot_mask, cv2.MORPH_CLOSE, kernel)
-        return robot_mask.astype(bool)
+    def project_world_points_to_mask(
+        self,
+        *,
+        world_points: Dict[str, np.ndarray],
+        intr: PinholeIntrinsics,
+        world2cam: np.ndarray,
+        height: int,
+        width: int,
+        return_timing: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, dict[str, float]]:
+        cv2 = _require_cv2(); H, W = int(height), int(width)
+        std = np.zeros((H, W), dtype=np.uint8); grip = np.zeros((H, W), dtype=np.uint8)
+        scale = max(1e-6, min(float(H) / 180.0, float(W) / 320.0))
+        rs, rg = max(1, int(round(30.0 * scale))), max(1, int(round(20.0 * scale)))
+        ks = max(3, int(round(30.0 * scale))); ks += (ks % 2 == 0)
+        kstd = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rs + 1, 2 * rs + 1))
+        kgrip = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * rg + 1, 2 * rg + 1))
+        kclose = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ks, ks))
+        ms_proj = ms_rast = 0.0
+        for key, target in (("standard", std), ("gripper", grip)):
+            pts = np.asarray(world_points.get(key, np.zeros((0, 3), dtype=np.float32)), dtype=np.float32)
+            if pts.size == 0: continue
+            t0 = time.perf_counter(); uv, okz = project_points_to_pixels(pts, world2cam=world2cam, intr=intr); ms_proj += (time.perf_counter() - t0) * 1000.0
+            t0 = time.perf_counter(); uv = np.round(uv[okz]).astype(np.int32); keep = (uv[:, 0] >= 0) & (uv[:, 0] < W) & (uv[:, 1] >= 0) & (uv[:, 1] < H); uv = uv[keep]
+            if uv.size: target[uv[:, 1], uv[:, 0]] = 1
+            ms_rast += (time.perf_counter() - t0) * 1000.0
+        t0 = time.perf_counter(); mask = np.zeros((H, W), dtype=np.uint8)
+        if np.any(std): mask |= cv2.dilate(std, kstd, iterations=1)
+        if np.any(grip): mask |= cv2.dilate(grip, kgrip, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kclose); ms_morph = (time.perf_counter() - t0) * 1000.0
+        mask = mask.astype(bool)
+        return (mask, {"ms_project": float(ms_proj), "ms_rasterize": float(ms_rast), "ms_morph": float(ms_morph)}) if return_timing else mask
 
 
 class OnlineSceneFlowBuilder:
@@ -318,6 +362,10 @@ class OnlineSceneFlowBuilder:
         self.query_manager = query_manager
         self._urdf_helper = None
         self._robot_mask_builder = None
+        self.last_timing: dict[str, object] = {}
+        self._shift_mask_build_counter = 0
+        self._shift_mask_cache: dict[tuple[str, int, int, int], np.ndarray] = {}
+        self._shift_mask_update_every = max(1, int(os.environ.get("MPPI_PW_SHIFT_MASK_UPDATE_EVERY", "1")))
 
     def _ensure_urdf_helper(self) -> None:
         if self._urdf_helper is not None:
@@ -338,6 +386,7 @@ class OnlineSceneFlowBuilder:
         window_shift: int = 1,
         robot_spheres_base: Optional[Sequence[np.ndarray]] = None,
     ) -> SceneFlowBuildOutput:
+        t_build0 = time.perf_counter()
         steps = self.window_buffer.get_window()
         T = len(steps)
         if int(T) != 11:
@@ -366,8 +415,32 @@ class OnlineSceneFlowBuilder:
         if seed_robot_mask_enabled:
             self._ensure_robot_mask_builder()
 
+        cam_timing: dict[str, object] = {}
+        robot_mask_seed = (int(self.cfg.robot_mask_seed) if getattr(self.cfg, "robot_mask_seed", None) is not None else None)
+        shift = max(0, min(int(window_shift), T - 1))
+        refresh_shift_mask = (self._shift_mask_update_every <= 1) or (self._shift_mask_build_counter % self._shift_mask_update_every == 0)
+        shift_epoch = self._shift_mask_build_counter // self._shift_mask_update_every
+        shared_world_points0 = None
+        shared_world_points_shift = None
+        if seed_robot_mask_enabled:
+            shared_world_points0 = self._robot_mask_builder.build_world_points(
+                joint_positions=np.asarray(steps[0].joint_positions, dtype=np.float32),
+                gripper_positions=np.asarray(steps[0].gripper_positions, dtype=np.float32),
+                seed=robot_mask_seed,
+            )
+            if refresh_shift_mask:
+                shared_world_points_shift = self._robot_mask_builder.build_world_points(
+                    joint_positions=np.asarray(steps[shift].joint_positions, dtype=np.float32),
+                    gripper_positions=np.asarray(steps[shift].gripper_positions, dtype=np.float32),
+                    seed=robot_mask_seed,
+                )
+
         for cam_name in cameras_used:
+            t_cam0 = time.perf_counter()
+
+            t_frames0 = time.perf_counter()
             frames = [np.asarray(s.cameras[cam_name].rgb) for s in steps]
+            ms_frames = (time.perf_counter() - t_frames0) * 1000.0
 
             cam0 = steps[0].cameras[cam_name]
             rgb0 = cam0.rgb
@@ -376,7 +449,11 @@ class OnlineSceneFlowBuilder:
             H0, W0 = int(depth0.shape[0]), int(depth0.shape[1])
             world2cam0 = invert_T(cam0.extrinsics)
 
+            t_valid0 = time.perf_counter()
             valid_mask0 = np.isfinite(depth0) & (np.asarray(depth0) > 0)
+            ms_valid0 = (time.perf_counter() - t_valid0) * 1000.0
+
+            t_ws0 = time.perf_counter()
             workspace_mask0 = compute_workspace_mask_2d(
                 height=H0,
                 width=W0,
@@ -385,20 +462,18 @@ class OnlineSceneFlowBuilder:
                 workspace_min=self.cfg.workspace_filter.workspace_min,
                 workspace_max=self.cfg.workspace_filter.workspace_max,
             )
+            ms_ws0 = (time.perf_counter() - t_ws0) * 1000.0
 
+            t_rm0 = time.perf_counter()
             if seed_robot_mask_enabled:
-                robot_mask0 = self._robot_mask_builder.build_mask(
-                    intr=cam0.intrinsics,
-                    world2cam=world2cam0,
-                    height=H0,
-                    width=W0,
-                    joint_positions=np.asarray(steps[0].joint_positions, dtype=np.float32),
-                    gripper_positions=np.asarray(steps[0].gripper_positions, dtype=np.float32),
-                    seed=(int(self.cfg.robot_mask_seed) if getattr(self.cfg, "robot_mask_seed", None) is not None else None),
+                robot_mask0, rm0_timing = self._robot_mask_builder.project_world_points_to_mask(
+                    world_points=shared_world_points0, intr=cam0.intrinsics, world2cam=world2cam0, height=H0, width=W0, return_timing=True
                 )
             else:
-                robot_mask0 = np.zeros((H0, W0), dtype=bool)
+                robot_mask0 = np.zeros((H0, W0), dtype=bool); rm0_timing = {"ms_project": 0.0, "ms_rasterize": 0.0, "ms_morph": 0.0}
+            ms_rm0 = (time.perf_counter() - t_rm0) * 1000.0
 
+            t_q0 = time.perf_counter()
             try:
                 q0 = self.query_manager.get_or_create(
                     cam_name,
@@ -409,12 +484,16 @@ class OnlineSceneFlowBuilder:
                     robot_mask=robot_mask0,
                 )
             except TypeError:
-                # Backwards-compatible fallback if the query manager doesn't support 2D gating.
                 q0 = self.query_manager.get_or_create(cam_name, rgb=rgb0, depth=depth0)
+            q_ms = (time.perf_counter() - t_q0) * 1000.0
 
+            t_cols0 = time.perf_counter()
             cols0 = _sample_rgb_at_uv(rgb0, q0)
+            ms_cols0 = (time.perf_counter() - t_cols0) * 1000.0
 
+            t_tr0 = time.perf_counter()
             track_out = self.tracker.track_window(frames, q0)
+            tr_ms = (time.perf_counter() - t_tr0) * 1000.0
 
             uv_tracks = np.asarray(track_out.uv_tracks, dtype=np.float32)
             visibility = np.asarray(track_out.visibility).astype(bool)
@@ -434,11 +513,24 @@ class OnlineSceneFlowBuilder:
             conf_out = np.zeros((T, q0.shape[0]), dtype=np.float32)
             ws_ok = np.zeros((T, q0.shape[0]), dtype=bool)
 
+            t_loop0 = time.perf_counter()
+            ms_lift3d = 0.0
+            ms_tf = 0.0
+            ms_ws_filter = 0.0
+            ms_robot_filter = 0.0
+            ms_ee_filter = 0.0
+            ms_ok = 0.0
+            ms_pack = 0.0
+
+            ee_enabled = bool(self.cfg.robot_filter.ee_filter_enabled)
+            min_conf = float(self.cfg.tracking.min_track_confidence)
+
             for t in range(T):
                 cam = steps[t].cameras[cam_name]
                 intr: PinholeIntrinsics = cam.intrinsics
                 depth_t = cam.depth
 
+                t_l0 = time.perf_counter()
                 xyz_cam, z_ok = lift_tracked_pixels_to_3d(
                     depth_t,
                     uv_tracks[t],
@@ -446,25 +538,34 @@ class OnlineSceneFlowBuilder:
                     depth_min_m=float(self.cfg.tracking.depth_min_m),
                     depth_max_m=float(self.cfg.tracking.depth_max_m),
                 )
-                xyzb = transform_points(cam.extrinsics, xyz_cam.reshape(-1, 3)).reshape(q0.shape[0], 3)
+                ms_lift3d += (time.perf_counter() - t_l0) * 1000.0
 
+                t_tf0 = time.perf_counter()
+                xyzb = transform_points(cam.extrinsics, xyz_cam.reshape(-1, 3)).reshape(q0.shape[0], 3)
+                ms_tf += (time.perf_counter() - t_tf0) * 1000.0
+
+                t_ws1 = time.perf_counter()
                 keep_ws = apply_workspace_mask_to_points(
                     xyzb,
                     workspace_min=self.cfg.workspace_filter.workspace_min,
                     workspace_max=self.cfg.workspace_filter.workspace_max,
                 )
+                ms_ws_filter += (time.perf_counter() - t_ws1) * 1000.0
                 ws_ok[t] = keep_ws & z_ok
 
                 if robot_spheres_base is None:
                     keep_robot = np.ones((q0.shape[0],), dtype=bool)
                 else:
+                    t_rb0 = time.perf_counter()
                     keep_robot = apply_robot_sphere_mask_to_points(
                         xyzb,
                         spheres=np.asarray(robot_spheres_base[t], dtype=np.float32),
                         margin=float(self.cfg.robot_filter.robot_mask_margin_m),
                     )
+                    ms_robot_filter += (time.perf_counter() - t_rb0) * 1000.0
 
-                if bool(self.cfg.robot_filter.ee_filter_enabled):
+                if ee_enabled:
+                    t_ee0 = time.perf_counter()
                     link_name = str(getattr(self.cfg.robot_filter, "ee_filter_link", ""))
                     if not link_name:
                         raise ValueError("ee_filter_enabled is True but cfg.robot_filter.ee_filter_link is empty")
@@ -480,24 +581,25 @@ class OnlineSceneFlowBuilder:
                         spheres=np.asarray(spheres_w, dtype=np.float32),
                         margin=float(self.cfg.robot_filter.ee_filter_margin_m),
                     )
+                    ms_ee_filter += (time.perf_counter() - t_ee0) * 1000.0
                 else:
                     keep_ee = np.ones((q0.shape[0],), dtype=bool)
 
-                ok = (
-                    visibility[t]
-                    & z_ok
-                    & keep_ws
-                    & keep_robot
-                    & keep_ee
-                    & (confidence[t] >= float(self.cfg.tracking.min_track_confidence))
-                )
+                t_ok0 = time.perf_counter()
+                ok = visibility[t] & z_ok & keep_ws & keep_robot & keep_ee & (confidence[t] >= float(min_conf))
+                ms_ok += (time.perf_counter() - t_ok0) * 1000.0
 
+                t_pk0 = time.perf_counter()
                 vis_out[t] = visibility[t]
                 depth_valid_out[t] = z_ok
                 xyz_base[t] = np.where(ok[:, None], xyzb, np.zeros_like(xyzb))
                 exists[t] = ok
                 conf_out[t] = np.where(ok, confidence[t], 0.0).astype(np.float32)
+                ms_pack += (time.perf_counter() - t_pk0) * 1000.0
 
+            ms_loop_total = (time.perf_counter() - t_loop0) * 1000.0
+
+            t_stab0 = time.perf_counter()
             r_ws = ws_ok.astype(np.float32).mean(axis=0) if ws_ok.size else np.zeros((q0.shape[0],), dtype=np.float32)
             cur = np.zeros((q0.shape[0],), dtype=np.int32)
             mx = np.zeros((q0.shape[0],), dtype=np.int32)
@@ -508,6 +610,7 @@ class OnlineSceneFlowBuilder:
             thr = float(self.cfg.workspace_filter.stability_ws_ratio_thresh)
             run_thr = int(self.cfg.workspace_filter.stability_ws_run_len_thresh)
             stable = (r_ws >= thr) & (mx >= run_thr)
+            ms_stability = (time.perf_counter() - t_stab0) * 1000.0
 
             strict_enabled = bool(getattr(self.cfg.workspace_filter, "strict_all_time_enabled", False))
             strict_all = np.all(ws_ok, axis=0) if ws_ok.size else np.zeros((q0.shape[0],), dtype=bool)
@@ -536,11 +639,7 @@ class OnlineSceneFlowBuilder:
             per_cam_conf[cam_name] = conf_out
             per_cam_cols[cam_name] = np.repeat(cols0[None, :, :], T, axis=0)
 
-            shift = int(window_shift)
-            if shift < 0:
-                shift = 0
-            if shift >= T:
-                shift = T - 1
+            shift = shift
 
             rgb_shift = steps[shift].cameras[cam_name].rgb
             depth_shift = steps[shift].cameras[cam_name].depth
@@ -552,7 +651,11 @@ class OnlineSceneFlowBuilder:
             Hs, Ws = int(depth_shift.shape[0]), int(depth_shift.shape[1])
             world2cams = invert_T(cam_s.extrinsics)
 
+            t_svalid0 = time.perf_counter()
             valid_masks = np.isfinite(depth_shift) & (np.asarray(depth_shift) > 0)
+            ms_shift_valid = (time.perf_counter() - t_svalid0) * 1000.0
+
+            t_sws0 = time.perf_counter()
             workspace_masks = compute_workspace_mask_2d(
                 height=Hs,
                 width=Ws,
@@ -561,20 +664,26 @@ class OnlineSceneFlowBuilder:
                 workspace_min=self.cfg.workspace_filter.workspace_min,
                 workspace_max=self.cfg.workspace_filter.workspace_max,
             )
+            ms_ws_shift = (time.perf_counter() - t_sws0) * 1000.0
 
+            t_srm0 = time.perf_counter()
+            shift_cache_hit = 0; shift_cache_miss = 0
             if seed_robot_mask_enabled:
-                robot_masks = self._robot_mask_builder.build_mask(
-                    intr=cam_s.intrinsics,
-                    world2cam=world2cams,
-                    height=Hs,
-                    width=Ws,
-                    joint_positions=np.asarray(steps[shift].joint_positions, dtype=np.float32),
-                    gripper_positions=np.asarray(steps[shift].gripper_positions, dtype=np.float32),
-                    seed=(int(self.cfg.robot_mask_seed) if getattr(self.cfg, "robot_mask_seed", None) is not None else None),
-                )
+                geom_key = (str(cam_name), int(Hs), int(Ws), int(shift), int(shift_epoch), int(robot_mask_seed or -1), _stable_sig(world2cams), _stable_sig((cam_s.intrinsics.fx, cam_s.intrinsics.fy, cam_s.intrinsics.cx, cam_s.intrinsics.cy)))
+                if refresh_shift_mask or (geom_key not in self._shift_mask_cache):
+                    if shared_world_points_shift is None:
+                        shared_world_points_shift = self._robot_mask_builder.build_world_points(joint_positions=np.asarray(steps[shift].joint_positions, dtype=np.float32), gripper_positions=np.asarray(steps[shift].gripper_positions, dtype=np.float32), seed=robot_mask_seed)
+                    robot_masks, rms_timing = self._robot_mask_builder.project_world_points_to_mask(world_points=shared_world_points_shift, intr=cam_s.intrinsics, world2cam=world2cams, height=Hs, width=Ws, return_timing=True)
+                    self._shift_mask_cache[geom_key] = np.asarray(robot_masks, dtype=bool); shift_cache_miss = 1
+                else:
+                    robot_masks = self._shift_mask_cache[geom_key]; rms_timing = {"ms_project": 0.0, "ms_rasterize": 0.0, "ms_morph": 0.0}; shift_cache_hit = 1
             else:
-                robot_masks = np.zeros((Hs, Ws), dtype=bool)
+                robot_masks = np.zeros((Hs, Ws), dtype=bool); rms_timing = {"ms_project": 0.0, "ms_rasterize": 0.0, "ms_morph": 0.0}
+            ms_rm_shift = (time.perf_counter() - t_srm0) * 1000.0
 
+            lift_ms = float(ms_loop_total)
+
+            t_adv0 = time.perf_counter()
             try:
                 self.query_manager.advance_window(
                     cam_name,
@@ -590,7 +699,6 @@ class OnlineSceneFlowBuilder:
                     robot_mask0=robot_masks,
                 )
             except TypeError:
-                # Backwards-compatible fallback if the query manager doesn't support 2D gating / stability.
                 self.query_manager.advance_window(
                     cam_name,
                     uv_tracks=uv_tracks,
@@ -603,6 +711,41 @@ class OnlineSceneFlowBuilder:
                     workspace_mask0=workspace_masks,
                     robot_mask0=robot_masks,
                 )
+            adv_ms = (time.perf_counter() - t_adv0) * 1000.0
+
+            cam_timing[str(cam_name)] = {
+                "ms_total": (time.perf_counter() - t_cam0) * 1000.0,
+                "ms_frames": float(ms_frames),
+                "ms_valid0": float(ms_valid0),
+                "ms_workspace0": float(ms_ws0),
+                "ms_robot_mask0": float(ms_rm0),
+                "ms_project_mask0": float(rm0_timing["ms_project"]),
+                "ms_rasterize_mask0": float(rm0_timing["ms_rasterize"]),
+                "ms_morph_mask0": float(rm0_timing["ms_morph"]),
+                "ms_query": float(q_ms),
+                "ms_sample_rgb0": float(ms_cols0),
+                "ms_track": float(tr_ms),
+                "ms_lift": float(lift_ms),
+                "ms_lift3d": float(ms_lift3d),
+                "ms_transform": float(ms_tf),
+                "ms_ws_filter": float(ms_ws_filter),
+                "ms_robot_filter": float(ms_robot_filter),
+                "ms_ee_filter": float(ms_ee_filter),
+                "ms_ok": float(ms_ok),
+                "ms_pack": float(ms_pack),
+                "ms_stability": float(ms_stability),
+                "ms_shift_valid": float(ms_shift_valid),
+                "ms_shift_workspace": float(ms_ws_shift),
+                "ms_shift_robot_mask": float(ms_rm_shift),
+                "ms_project_mask_shift": float(rms_timing["ms_project"]),
+                "ms_rasterize_mask_shift": float(rms_timing["ms_rasterize"]),
+                "ms_morph_mask_shift": float(rms_timing["ms_morph"]),
+                "shift_mask_cache_hit": int(shift_cache_hit),
+                "shift_mask_cache_miss": int(shift_cache_miss),
+                "ms_advance": float(adv_ms),
+                "n_query": int(q0.shape[0]),
+                "hw": [int(H0), int(W0)],
+            }
 
         xyz_list = [per_cam_xyz[n] for n in cameras_used]
         cols_list = [per_cam_cols[n] for n in cameras_used]
@@ -627,6 +770,12 @@ class OnlineSceneFlowBuilder:
             camera_track_slices.append((start, end))
             camera_track_ids[start:end] = int(i)
             start = end
+
+        self.last_timing = {
+            "ms_total": (time.perf_counter() - t_build0) * 1000.0,
+            "cams": cam_timing,
+        }
+        self._shift_mask_build_counter += 1
 
         return SceneFlowBuildOutput(
             scene_flows=scene_flows,

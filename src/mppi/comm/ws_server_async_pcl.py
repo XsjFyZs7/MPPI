@@ -620,6 +620,7 @@ class _PointWorldRuntime:
     last_hw_by_camera: Dict[str, Tuple[int, int]] = field(default_factory=dict)
     last_step_id: int = -1
     last_ts_s: float = float("nan")
+    last_build_timing: Dict[str, Any] = field(default_factory=dict)
 
     consecutive_build_failures: int = 0
     disabled_until_ts_s: float = 0.0
@@ -676,22 +677,32 @@ class _PointWorldRuntime:
             raise ValueError("q must have at least 7 elements")
         q7 = q7[:7]
 
+        build_tb: Dict[str, Any] = {}
+
+        t_push0 = time.perf_counter()
         self.window.push_frame(
             cameras={str(k): v for k, v in dict(cameras).items()},
             joint_positions=q7,
             gripper_positions=np.asarray([float(gripper)], dtype=np.float32),
             timestamp=float(ts_s),
         )
+        build_tb["t_window_push_ms"] = (time.perf_counter() - t_push0) * 1000.0
 
         if not self.window.is_ready():
+            self.last_build_timing = dict(build_tb)
             return None
 
         if float(ts_s) < float(self.disabled_until_ts_s):
             return self.last_pointworld_obs
 
+        t_scene0 = time.perf_counter()
         try:
             scene = self.builder.build(window_shift=1, robot_spheres_base=None)
+            build_tb["t_scene_build_ms"] = (time.perf_counter() - t_scene0) * 1000.0
+            if isinstance(getattr(self.builder, "last_timing", None), dict) and getattr(self.builder, "last_timing", None):
+                build_tb["scene_build_breakdown"] = dict(getattr(self.builder, "last_timing"))
         except Exception as e:
+            build_tb["t_scene_build_ms"] = (time.perf_counter() - t_scene0) * 1000.0
             self.consecutive_build_failures = int(self.consecutive_build_failures) + 1
             self.last_build_error = type(e).__name__
 
@@ -716,12 +727,14 @@ class _PointWorldRuntime:
         q_win = np.stack([np.asarray(s.joint_positions, dtype=np.float32).reshape(-1)[:7] for s in steps], axis=0)
         g_win = np.asarray([float(np.asarray(s.gripper_positions).reshape(-1)[0]) for s in steps], dtype=np.float32)
 
+        t_batch0 = time.perf_counter()
         batch = build_pointworld_batch(
             scene=scene,
             robot_flows=None,
             robot_positions=q_win,
             gripper_positions=g_win,
         )
+        build_tb["t_build_batch_ms"] = (time.perf_counter() - t_batch0) * 1000.0
 
         T = int(q_win.shape[0])
         gripper_open = (g_win < 0.1).astype(bool).reshape(int(T), 1)
@@ -737,12 +750,16 @@ class _PointWorldRuntime:
         obs["gripper_open"] = gripper_open
 
         if _env_bool("MPPI_PW_GRIPPER_POSE_ENABLED", "1" if DEFAULT_PW_GRIPPER_POSE_ENABLED else "0"):
+            t_fk0 = time.perf_counter()
             urdf_path = self.cfg.urdf_path
             if not urdf_path:
                 raise ValueError("cfg.urdf_path is required to compute gripper_pose. Set MPPI_PW_URDF_PATH.")
             link_name = os.getenv("MPPI_PW_GRIPPER_LINK", "robotiq_85_base_link").strip() or "robotiq_85_base_link"
             poses = [fk_T_base_link(urdf_path=str(urdf_path), q7=q_win[i], link_name=link_name) for i in range(int(T))]
             obs["gripper_pose"] = np.stack(poses, axis=0).astype(np.float32, copy=False)
+            build_tb["t_gripper_pose_fk_ms"] = (time.perf_counter() - t_fk0) * 1000.0
+
+        t_task0 = time.perf_counter()
 
         ablation = os.getenv("MPPI_PW_TASK_ABLATION", DEFAULT_PW_TASK_ABLATION).strip().lower()
         if ablation not in {"no_pw", "obs_only", "obs_infl"}:
@@ -876,6 +893,9 @@ class _PointWorldRuntime:
                     obs["task_goal_positions"] = goal.reshape(3)
             except Exception:
                 pass
+
+        build_tb["t_task_selector_ms"] = (time.perf_counter() - t_task0) * 1000.0
+        self.last_build_timing = dict(build_tb)
 
         self.last_pointworld_obs = obs
         return obs
@@ -1160,6 +1180,8 @@ async def _handle_connection(
                         gripper=float(obs.gripper),
                     )
                     tb["t_pw_build_ms"] = (time.perf_counter() - t_pw0) * 1000.0
+                    if isinstance(getattr(pw, "last_build_timing", None), dict) and getattr(pw, "last_build_timing", None):
+                        tb["pw_build_breakdown"] = dict(getattr(pw, "last_build_timing"))
                     _maybe_dump_pointworld_acceptance(pointworld_obs=pw.last_pointworld_obs, step_id=int(obs.step_id))
                 except Exception as e:  # noqa: BLE001
                     tb["t_pw_build_ms"] = (time.perf_counter() - t_pw0) * 1000.0
@@ -1253,6 +1275,11 @@ async def _handle_connection(
                     "reason": str(getattr(solver, "last_pw_reason", "") or ""),
                     "ms": float(getattr(solver, "last_pw_ms", 0.0) or 0.0),
                 }
+
+                if pw is not None and bool(getattr(pw, "enabled", False)) and getattr(pw, "cost_model", None) is not None:
+                    timing = getattr(pw.cost_model, "last_timing", None)
+                    if isinstance(timing, dict) and timing:
+                        pw_cost_debug["timing"] = dict(timing)
 
                 if pw_cost_error:
                     tb = str(pw_cost_error.get("traceback", "") or "")

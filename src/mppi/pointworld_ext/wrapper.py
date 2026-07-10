@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
+import time
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -55,6 +56,7 @@ class PointWorldCostModel:
         self._domain = str(cfg.domain or self._data_contract["domains"][0])
         self._devices = self._expand_device_list(str(cfg.device), fallback="cuda")
         self._robot_devices = self._resolve_robot_devices()
+        self.last_timing: dict[str, Any] = {}
 
         self.max_scene_points = int(
             cfg.max_scene_points
@@ -426,18 +428,35 @@ class PointWorldCostModel:
         replica: _PointWorldReplica,
         scene_np: dict[str, np.ndarray],
         batch_np: dict[str, np.ndarray],
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, dict[str, Any]]:
         B = int(batch_np["robot_flows"].shape[0])
         chunk_size = max(1, min(int(self.cfg.eval_batch_size), B))
         costs: list[np.ndarray] = []
         torch = self._torch
+
+        timing: dict[str, Any] = {
+            "device": str(replica.device),
+            "B": int(B),
+            "chunk_size": int(chunk_size),
+            "chunks": 0,
+            "t_scene_to_torch_ms": 0.0,
+            "t_scene_features_ms": 0.0,
+            "t_dist2robot_ms": 0.0,
+            "t_model_ms": 0.0,
+            "t_reduce_ms": 0.0,
+            "t_total_ms": 0.0,
+        }
+
+        t_rep0 = time.perf_counter()
 
         device_s = str(replica.device).split(",")[0].strip()
         device_t = torch.device(device_s)
         if device_t.type == "cuda":
             torch.cuda.set_device(device_t.index if device_t.index is not None else 0)
 
+        t_s2t0 = time.perf_counter()
         scene_t = self._numpy_batch_to_torch(scene_np, device=replica.device)
+        timing["t_scene_to_torch_ms"] = (time.perf_counter() - t_s2t0) * 1000.0
 
         for start in range(0, B, chunk_size):
             end = min(B, start + chunk_size)
@@ -448,13 +467,23 @@ class PointWorldCostModel:
             scene_flows_t = scene_t["scene_flows"].expand(chunk_b, -1, -1, -1)
             scene_colors_t = scene_t["scene_colors"].expand(chunk_b, -1, -1, -1)
             scene_exists_t = scene_t["scene_exists"].expand(chunk_b, -1, -1)
-            scene_features_t = build_scene_features_torch(
+            t_feat0 = time.perf_counter()
+            out = build_scene_features_torch(
                 scene_flows=scene_flows_t,
                 scene_colors=scene_colors_t,
                 gripper_positions=robot_t["gripper_positions"],
                 robot_flows=robot_t["robot_flows"],
                 robot_exists=robot_t["robot_exists"],
+                return_timing=True,
             )
+            if isinstance(out, tuple) and len(out) == 2:
+                scene_features_t, feat_timing = out
+            else:
+                scene_features_t, feat_timing = out, {}
+            timing["t_scene_features_ms"] = float(timing["t_scene_features_ms"]) + (time.perf_counter() - t_feat0) * 1000.0
+            if isinstance(feat_timing, dict):
+                timing["t_dist2robot_ms"] = float(timing["t_dist2robot_ms"]) + float(feat_timing.get("t_dist2robot_ms", 0.0) or 0.0)
+
             batch_t = {
                 "scene_flows": scene_flows_t,
                 "scene_exists": scene_exists_t,
@@ -465,6 +494,7 @@ class PointWorldCostModel:
                 "__domain__": [self._domain] * chunk_b,
             }
 
+            t_m0 = time.perf_counter()
             with torch.no_grad():
                 encoded_scene = self._encode_scene_raw_only(
                     batch_t["scene_features"][:, 0],
@@ -472,6 +502,7 @@ class PointWorldCostModel:
                     device=replica.device,
                 )
                 outputs = replica.model(batch_t, training=False, encoded_scene_feat0=encoded_scene)
+            timing["t_model_ms"] = float(timing["t_model_ms"]) + (time.perf_counter() - t_m0) * 1000.0
 
             model_conf = outputs.get("confidence")
             track_conf_t = None
@@ -490,6 +521,7 @@ class PointWorldCostModel:
                 terms.append((scene_t.get("task_point_indices"), scene_t.get("task_goal_positions"), 1.0))
 
             if terms:
+                t_r0 = time.perf_counter()
                 total = torch.zeros((chunk_b,), device=replica.device, dtype=torch.float32)
                 for idx_term, goal_term, w_term in terms:
                     if float(w_term) == 0.0:
@@ -504,10 +536,12 @@ class PointWorldCostModel:
                         task_goal_positions=goal_term,
                         cfg=self.cfg.cost,
                     )
+                timing["t_reduce_ms"] = float(timing["t_reduce_ms"]) + (time.perf_counter() - t_r0) * 1000.0
                 costs.append(total.detach().cpu().numpy().astype(np.float32))
             elif task_mode:
                 costs.append(torch.zeros((chunk_b,), device=replica.device, dtype=torch.float32).detach().cpu().numpy().astype(np.float32))
             else:
+                t_r0 = time.perf_counter()
                 costs.append(
                     reduce_pointworld_cost_torch(
                         scene_relative=outputs["scene_relative"],
@@ -517,8 +551,12 @@ class PointWorldCostModel:
                         cfg=self.cfg.cost,
                     ).detach().cpu().numpy().astype(np.float32)
                 )
+                timing["t_reduce_ms"] = float(timing["t_reduce_ms"]) + (time.perf_counter() - t_r0) * 1000.0
 
-        return np.concatenate(costs, axis=0).astype(np.float32, copy=False)
+            timing["chunks"] = int(timing["chunks"]) + 1
+
+        timing["t_total_ms"] = (time.perf_counter() - t_rep0) * 1000.0
+        return np.concatenate(costs, axis=0).astype(np.float32, copy=False), timing
 
     def _evaluate_cost_on_replica(
         self,
@@ -527,14 +565,20 @@ class PointWorldCostModel:
         q_traj: np.ndarray,
         pointworld_obs: dict[str, Any],
         gripper: Optional[float],
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        t_p0 = time.perf_counter()
         scene_np, batch_np = self._prepare_batch(
             q_traj=q_traj,
             pointworld_obs=pointworld_obs,
             gripper=gripper,
             robot=replica.robot,
         )
-        return self._evaluate_batch_on_replica(replica=replica, scene_np=scene_np, batch_np=batch_np)
+        t_prepare_ms = (time.perf_counter() - t_p0) * 1000.0
+        costs, timing = self._evaluate_batch_on_replica(replica=replica, scene_np=scene_np, batch_np=batch_np)
+        timing = dict(timing)
+        timing["t_prepare_batch_ms"] = float(t_prepare_ms)
+        timing["t_total_with_prepare_ms"] = float(t_prepare_ms) + float(timing.get("t_total_ms", 0.0) or 0.0)
+        return costs, timing
 
     def _make_ranges(self, total: int, parts: int) -> list[tuple[int, int]]:
         if total <= 0 or parts <= 0:
@@ -566,35 +610,45 @@ class PointWorldCostModel:
             return np.zeros((0,), dtype=np.float32)
 
         if len(self._replicas) == 1:
-            return self._evaluate_cost_on_replica(
+            out, timing = self._evaluate_cost_on_replica(
                 replica=self._replicas[0],
                 q_traj=q,
                 pointworld_obs=pointworld_obs,
                 gripper=gripper,
             )
+            self.last_timing = {
+                "mode": "single",
+                "devices": [str(self._replicas[0].device)],
+                "replicas": [dict(timing)],
+            }
+            return out
 
         ranges = self._make_ranges(B, len(self._replicas))
         costs = np.zeros((B,), dtype=np.float32)
 
-        def _worker(replica: _PointWorldReplica, start: int, end: int) -> tuple[int, int, np.ndarray]:
-            return (
-                int(start),
-                int(end),
-                self._evaluate_cost_on_replica(
-                    replica=replica,
-                    q_traj=q[start:end],
-                    pointworld_obs=pointworld_obs,
-                    gripper=gripper,
-                ),
+        def _worker(replica: _PointWorldReplica, start: int, end: int) -> tuple[int, int, np.ndarray, dict[str, Any]]:
+            out, timing = self._evaluate_cost_on_replica(
+                replica=replica,
+                q_traj=q[start:end],
+                pointworld_obs=pointworld_obs,
+                gripper=gripper,
             )
+            return (int(start), int(end), out, dict(timing))
 
         with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
             futures = [
                 pool.submit(_worker, self._replicas[idx], start, end)
                 for idx, (start, end) in enumerate(ranges)
             ]
+            rep_timings: list[dict[str, Any]] = []
             for fut in futures:
-                start, end, arr = fut.result()
+                start, end, arr, timing = fut.result()
                 costs[start:end] = arr
+                rep_timings.append(dict(timing))
 
+        self.last_timing = {
+            "mode": "multi",
+            "devices": [str(r.device) for r in self._replicas],
+            "replicas": rep_timings,
+        }
         return costs
