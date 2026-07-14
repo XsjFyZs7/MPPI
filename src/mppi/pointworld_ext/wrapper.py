@@ -19,6 +19,7 @@ from mppi.pointworld_ext.flows import (
     RobotFlowAdapter,
     build_robot_inputs,
     build_scene_features_torch,
+    normalize_dist2robot_mode,
     prepare_scene_inputs,
 )
 from mppi.utils.paths import default_pointworld_root, default_urdf_path, ensure_sys_path_for_runtime
@@ -44,6 +45,7 @@ class PointWorldModelConfig:
     seed: int = 1
     disable_compile: bool = True
     eval_batch_size: int = 32
+    dist2robot_mode: str = "t0_repeat"
     cost: PointWorldCostConfig = field(default_factory=PointWorldCostConfig)
 
 
@@ -56,7 +58,9 @@ class PointWorldCostModel:
         self._domain = str(cfg.domain or self._data_contract["domains"][0])
         self._devices = self._expand_device_list(str(cfg.device), fallback="cuda")
         self._robot_devices = self._resolve_robot_devices()
+        self._dist2robot_mode = normalize_dist2robot_mode(cfg.dist2robot_mode)
         self.last_timing: dict[str, Any] = {}
+        self.last_eval_ranges: tuple[dict[str, Any], ...] = ()
 
         self.max_scene_points = int(
             cfg.max_scene_points
@@ -474,6 +478,7 @@ class PointWorldCostModel:
                 gripper_positions=robot_t["gripper_positions"],
                 robot_flows=robot_t["robot_flows"],
                 robot_exists=robot_t["robot_exists"],
+                dist2robot_mode=self._dist2robot_mode,
                 return_timing=True,
             )
             if isinstance(out, tuple) and len(out) == 2:
@@ -483,6 +488,7 @@ class PointWorldCostModel:
             timing["t_scene_features_ms"] = float(timing["t_scene_features_ms"]) + (time.perf_counter() - t_feat0) * 1000.0
             if isinstance(feat_timing, dict):
                 timing["t_dist2robot_ms"] = float(timing["t_dist2robot_ms"]) + float(feat_timing.get("t_dist2robot_ms", 0.0) or 0.0)
+                timing["dist2robot_mode"] = str(feat_timing.get("dist2robot_mode", self._dist2robot_mode))
 
             batch_t = {
                 "scene_flows": scene_flows_t,
@@ -610,29 +616,45 @@ class PointWorldCostModel:
             return np.zeros((0,), dtype=np.float32)
 
         if len(self._replicas) == 1:
-            out, timing = self._evaluate_cost_on_replica(
+            result = self._evaluate_cost_on_replica(
                 replica=self._replicas[0],
                 q_traj=q,
                 pointworld_obs=pointworld_obs,
                 gripper=gripper,
+            )
+            if isinstance(result, tuple) and len(result) == 2:
+                out, timing = result
+            else:
+                out, timing = result, {}
+            self.last_eval_ranges = (
+                {
+                    "device": str(self._replicas[0].device),
+                    "start": 0,
+                    "end": int(B),
+                    "samples": int(B),
+                },
             )
             self.last_timing = {
                 "mode": "single",
                 "devices": [str(self._replicas[0].device)],
                 "replicas": [dict(timing)],
             }
-            return out
+            return np.asarray(out, dtype=np.float32)
 
         ranges = self._make_ranges(B, len(self._replicas))
         costs = np.zeros((B,), dtype=np.float32)
 
         def _worker(replica: _PointWorldReplica, start: int, end: int) -> tuple[int, int, np.ndarray, dict[str, Any]]:
-            out, timing = self._evaluate_cost_on_replica(
+            result = self._evaluate_cost_on_replica(
                 replica=replica,
                 q_traj=q[start:end],
                 pointworld_obs=pointworld_obs,
                 gripper=gripper,
             )
+            if isinstance(result, tuple) and len(result) == 2:
+                out, timing = result
+            else:
+                out, timing = result, {}
             return (int(start), int(end), out, dict(timing))
 
         with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
@@ -644,8 +666,21 @@ class PointWorldCostModel:
             for fut in futures:
                 start, end, arr, timing = fut.result()
                 costs[start:end] = arr
+                timing = dict(timing)
+                timing["start"] = int(start)
+                timing["end"] = int(end)
+                timing["samples"] = int(end - start)
                 rep_timings.append(dict(timing))
 
+        self.last_eval_ranges = tuple(
+            {
+                "device": str(self._replicas[idx].device),
+                "start": int(start),
+                "end": int(end),
+                "samples": int(end - start),
+            }
+            for idx, (start, end) in enumerate(ranges)
+        )
         self.last_timing = {
             "mode": "multi",
             "devices": [str(r.device) for r in self._replicas],

@@ -6,8 +6,16 @@ PROFILE="${2:-obs_infl}"    # no_pw(baseline:disable PW cost) | obs_only | obs_i
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
-POINTWORLD_ROOT="${POINTWORLD_ROOT:-/home/wangyuhan/PointWorld}"
-DINOv3_ROOT="${DINOv3_ROOT:-/home/wangyuhan/PointWorld/third_party/dinov3}"
+if [[ -z "${POINTWORLD_ROOT:-}" ]]; then
+  for candidate in "${REPO_ROOT}/../PointWorld" /workspace/pointworld /home/wangning/PointWorld /home/wangyuhan/PointWorld; do
+    if [[ -d "${candidate}" ]]; then
+      POINTWORLD_ROOT="${candidate}"
+      break
+    fi
+  done
+fi
+POINTWORLD_ROOT="${POINTWORLD_ROOT:-/home/wangning/PointWorld}"
+DINOv3_ROOT="${DINOv3_ROOT:-${POINTWORLD_ROOT}/third_party/dinov3}"
 
 export PYTHONPATH="${REPO_ROOT}/src:${REPO_ROOT}/third_party/co-tracker:${REPO_ROOT}/third_party/curobo:${PYTHONPATH:-}"
 if [[ -d "${POINTWORLD_ROOT}" ]]; then
@@ -38,7 +46,7 @@ MAX_STEPS="${MAX_STEPS:-16}"
 SLEEP_S="${SLEEP_S:-0.0}"
 GRIPPER="${GRIPPER:-0.0}"
 DEPTH_UNIT_SCALE="${DEPTH_UNIT_SCALE:-1.0}"
-REQUEST_TIMEOUT_S="${REQUEST_TIMEOUT_S:-10}"
+REQUEST_TIMEOUT_S="${REQUEST_TIMEOUT_S:-30.0}"
 GOAL_EE_XYZ="${GOAL_EE_XYZ:-0.55,0.00,0.20}"
 
 mkdir -p "${OUT_ROOT}"
@@ -104,8 +112,10 @@ run_server() {
   export MPPI_PW_MODEL_DEVICE="${MPPI_PW_MODEL_DEVICE:-cuda:0}"
   export MPPI_PW_COTRACKER_DEVICE="${MPPI_PW_COTRACKER_DEVICE:-cuda:0}"
   export MPPI_PW_ROBOT_SAMPLER_DEVICE="${MPPI_PW_ROBOT_SAMPLER_DEVICE:-${MPPI_PW_MODEL_DEVICE}}"
+  export MPPI_PW_DIST2ROBOT_MODE="${MPPI_PW_DIST2ROBOT_MODE:-t0_repeat}"
   if [[ -n "${PW_MULTI_GPU_DEVICES}" ]]; then
     export MPPI_PW_MODEL_DEVICE="${PW_MULTI_GPU_DEVICES}"
+    export MPPI_PW_COTRACKER_DEVICE="${PW_MULTI_GPU_DEVICES}"
     export MPPI_PW_ROBOT_SAMPLER_DEVICE="${PW_MULTI_GPU_DEVICES}"
   fi
   export MPPI_PW_MODEL_DOMAIN="${MPPI_PW_MODEL_DOMAIN:-droid}"
@@ -114,7 +124,7 @@ run_server() {
   export MPPI_PW_URDF_PATH="${MPPI_PW_URDF_PATH:-${MPPI_URDF_PATH}}"
 
   if [[ ! -f "${DINOv3_ROOT}/hubconf.py" ]]; then
-    echo "Missing DINOv3 hubconf.py at ${DINOv3_ROOT}. Expected: /home/wangyuhan/PointWorld/third_party/dinov3" >&2
+    echo "Missing DINOv3 hubconf.py at ${DINOv3_ROOT}. Expected: ${POINTWORLD_ROOT}/third_party/dinov3" >&2
     exit 1
   fi
 
@@ -125,7 +135,9 @@ run_server() {
   fi
 
   echo "[acceptance] pw_model_device=${MPPI_PW_MODEL_DEVICE}"
+  echo "[acceptance] pw_cotracker_device=${MPPI_PW_COTRACKER_DEVICE}"
   echo "[acceptance] pw_robot_sampler_device=${MPPI_PW_ROBOT_SAMPLER_DEVICE}"
+  echo "[acceptance] pw_dist2robot_mode=${MPPI_PW_DIST2ROBOT_MODE}"
 
   python3 -u -m mppi.comm.ws_server_async_pcl \
     --host 0.0.0.0 \

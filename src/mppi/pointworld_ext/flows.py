@@ -289,6 +289,8 @@ def build_scene_features(
     gripper_positions: np.ndarray,
     robot_flows: np.ndarray,
     robot_exists: np.ndarray | None = None,
+    dist2robot_mode: str = "t0_repeat",
+    dist2robot_chunk_size: int = 256,
 ) -> np.ndarray:
     feat_t = build_scene_features_torch(
         scene_flows=scene_flows,
@@ -296,11 +298,44 @@ def build_scene_features(
         gripper_positions=gripper_positions,
         robot_flows=robot_flows,
         robot_exists=robot_exists,
+        dist2robot_mode=dist2robot_mode,
+        dist2robot_chunk_size=dist2robot_chunk_size,
     )
     return feat_t.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
-def build_scene_features_torch(*, scene_flows, scene_colors, gripper_positions, robot_flows, robot_exists=None, return_timing: bool = False):
+def normalize_dist2robot_mode(raw: str) -> str:
+    mode = str(raw or "").strip().lower().replace("-", "_")
+    aliases = {
+        "": "t0_repeat",
+        "t0": "t0_repeat",
+        "t0_expand": "t0_repeat",
+        "first": "t0_repeat",
+        "first_frame": "t0_repeat",
+        "repeat": "t0_repeat",
+        "fast": "t0_repeat",
+        "off": "none",
+        "disabled": "none",
+        "zero": "none",
+        "zeros": "none",
+    }
+    mode = aliases.get(mode, mode)
+    if mode not in {"full", "t0_repeat", "none"}:
+        raise ValueError("dist2robot_mode must be one of: full, t0_repeat, none")
+    return mode
+
+
+def build_scene_features_torch(
+    *,
+    scene_flows,
+    scene_colors,
+    gripper_positions,
+    robot_flows,
+    robot_exists=None,
+    dist2robot_mode: str = "t0_repeat",
+    dist2robot_chunk_size: int = 256,
+    return_timing: bool = False,
+):
     try:
         import torch
     except Exception as e:  # noqa: BLE001
@@ -325,19 +360,31 @@ def build_scene_features_torch(*, scene_flows, scene_colors, gripper_positions, 
     Ns = int(flows.shape[2])
 
     p0 = flows[:, 0]
-    pts0 = robot[:, 0]
-    valid0 = exists[:, 0]
 
     t_d20 = time.perf_counter()
-    block = 256
-    out0 = torch.empty((B, Ns), device=flows.device, dtype=torch.float32)
-    for s in range(0, Ns, block):
-        e = min(s + block, Ns)
-        d = torch.cdist(p0[:, s:e], pts0)
-        d = d.masked_fill(~valid0[:, None, :], float("inf"))
-        out0[:, s:e] = d.min(dim=-1).values
+    mode = normalize_dist2robot_mode(dist2robot_mode)
+    block = max(1, int(dist2robot_chunk_size))
 
-    dist2robot = out0[:, None, :, None].expand(B, 1, Ns, T)
+    def _dist_at_t(t: int):
+        pts = robot[:, t]
+        valid = exists[:, t]
+        out_t = torch.empty((B, Ns), device=flows.device, dtype=torch.float32)
+        for s in range(0, Ns, block):
+            e = min(s + block, Ns)
+            d = torch.cdist(p0[:, s:e], pts)
+            d = d.masked_fill(~valid[:, None, :], float("inf"))
+            out_t[:, s:e] = d.min(dim=-1).values
+        return out_t
+
+    if mode == "none":
+        dist2robot = torch.zeros((B, 1, Ns, T), device=flows.device, dtype=torch.float32)
+    elif mode == "t0_repeat":
+        out0 = _dist_at_t(0)
+        dist2robot = out0[:, None, :, None].expand(B, 1, Ns, T)
+    else:
+        dist2robot = torch.empty((B, 1, Ns, T), device=flows.device, dtype=torch.float32)
+        for t in range(T):
+            dist2robot[:, 0, :, t] = _dist_at_t(t)
     t_dist2robot_ms = (time.perf_counter() - t_d20) * 1000.0
 
     normals0 = torch.zeros((B, 1, Ns, 3), device=flows.device, dtype=torch.float32)
@@ -350,7 +397,7 @@ def build_scene_features_torch(*, scene_flows, scene_colors, gripper_positions, 
         return feat
 
     timing = {
-        "dist2robot_mode": "t0_expand",
+        "dist2robot_mode": mode,
         "t_dist2robot_ms": float(t_dist2robot_ms),
         "t_total_ms": float((time.perf_counter() - t0) * 1000.0),
         "block": int(block),
