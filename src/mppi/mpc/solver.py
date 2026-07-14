@@ -320,6 +320,9 @@ class JointMPPISolver:
         self.last_pw_reason: str = ""
         self.last_pw_ms: float = 0.0
 
+        self.last_goal_ee_xyz: Optional[tuple[float, float, float]] = None
+        self.last_goal_error_final_m: float = float("nan")
+
         self._fk: FrankaFK | None = None
         self._fk_link7: FrankaFK | None = None
 
@@ -359,6 +362,7 @@ class JointMPPISolver:
         pointworld_obs: Optional[dict[str, Any]] = None,
         pointworld_cost_fn: Optional[PointWorldCostFn] = None,
         gripper: Optional[float] = None,
+        ee_pos_goal: Optional[tuple[float, float, float]] = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         dq = q_traj[:, 1:, :] - q_traj[:, :-1, :]
         smooth_raw = np.sum(dq * dq, axis=(1, 2)).astype(np.float32)
@@ -373,10 +377,11 @@ class JointMPPISolver:
         t_action = float(self.cfg.w_action) * act_raw
         t_joint_limit = float(self.cfg.w_joint_limit) * joint_limit_raw
 
+        ee_goal = ee_pos_goal if ee_pos_goal is not None else self.cfg.ee_pos_goal
         t_ee_pos = np.zeros((q_traj.shape[0],), dtype=np.float32)
-        if float(self.cfg.w_ee_pos) > 0.0 and self.cfg.ee_pos_goal is not None:
+        if float(self.cfg.w_ee_pos) > 0.0 and ee_goal is not None:
             q_T = q_traj[:, -1, :]
-            t_ee_pos = float(self.cfg.w_ee_pos) * ee_pos_cost(self._get_fk(), q_T, self.cfg.ee_pos_goal)
+            t_ee_pos = float(self.cfg.w_ee_pos) * ee_pos_cost(self._get_fk(), q_T, ee_goal)
 
         t_link7_pos = np.zeros((q_traj.shape[0],), dtype=np.float32)
         if float(self.cfg.w_link7_pos) > 0.0 and self.cfg.link7_pos_goal is not None:
@@ -471,6 +476,7 @@ class JointMPPISolver:
         self,
         q0: list[float],
         gripper: float,
+        ee_pos_goal: Optional[tuple[float, float, float]] = None,
         seed: Optional[int] = None,
         pcd_back_cam: Optional[object] = None,
         pointworld_obs: Optional[dict[str, Any]] = None,
@@ -495,6 +501,9 @@ class JointMPPISolver:
         self.last_pw_enabled = False
         self.last_pw_reason = ""
         self.last_pw_ms = 0.0
+
+        self.last_goal_ee_xyz = None
+        self.last_goal_error_final_m = float("nan")
 
         t_infer0 = __import__("time").perf_counter()
 
@@ -673,6 +682,7 @@ class JointMPPISolver:
                 pointworld_obs=pointworld_obs,
                 pointworld_cost_fn=pointworld_cost_fn,
                 gripper=gripper,
+                ee_pos_goal=ee_pos_goal,
             )
             self.last_pw_ms = float(extra.get("pointworld_ms", 0.0))
             self.last_pw_reason = str(extra.get("pointworld_reason", ""))
@@ -729,7 +739,15 @@ class JointMPPISolver:
         if self.last_fallback:
             actions[:, 0:7] = q0_np[None, :]
             actions[:, 7] = float(gripper)
-            self.last_infer_ms = ( __import__("time").perf_counter() - t_infer0) * 1000.0
+            self.last_infer_ms = (__import__("time").perf_counter() - t_infer0) * 1000.0
+
+            goal = ee_pos_goal if ee_pos_goal is not None else self.cfg.ee_pos_goal
+            self.last_goal_ee_xyz = goal
+            if goal is not None:
+                qT = np.asarray(actions[-1, 0:7], dtype=np.float32).reshape(1, 7)
+                pos = self._get_fk().fk_pos(qT)[0]
+                self.last_goal_error_final_m = float(np.linalg.norm(pos - np.asarray(goal, dtype=np.float32).reshape(3)))
+
             return actions
 
         q_cur = q0_np.copy()
@@ -755,6 +773,13 @@ class JointMPPISolver:
         suffix = ""
         if parts:
             suffix = ":" + ":".join(parts)
+
+        goal = ee_pos_goal if ee_pos_goal is not None else self.cfg.ee_pos_goal
+        self.last_goal_ee_xyz = goal
+        if goal is not None:
+            qT = np.asarray(actions[-1, 0:7], dtype=np.float32).reshape(1, 7)
+            pos = self._get_fk().fk_pos(qT)[0]
+            self.last_goal_error_final_m = float(np.linalg.norm(pos - np.asarray(goal, dtype=np.float32).reshape(3)))
 
         if budget_enabled and float(self.last_infer_ms) > float(budget_ms):
             next_action = "hold"

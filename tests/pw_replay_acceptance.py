@@ -361,6 +361,7 @@ async def run(args: argparse.Namespace) -> None:
                     step_id=int(step_id),
                     q=q,
                     gripper=float(args.gripper),
+                    goal_ee_xyz=(list(args.goal_ee_xyz) if getattr(args, "goal_ee_xyz", None) is not None else None),
                     cam_id=str(args.primary_cam_id),
                     depth_unit_scale=float(args.depth_unit_scale),
                     cameras=cameras,
@@ -373,6 +374,7 @@ async def run(args: argparse.Namespace) -> None:
                     step_id=int(step_id),
                     q=q,
                     gripper=float(args.gripper),
+                    goal_ee_xyz=(list(args.goal_ee_xyz) if getattr(args, "goal_ee_xyz", None) is not None else None),
                     cam_id=str(args.primary_cam_id),
                     depth_unit_scale=float(args.depth_unit_scale),
                     rgb_codec=str(single["rgb_codec"]),
@@ -457,9 +459,19 @@ def main() -> None:
     ap.add_argument("--gripper", type=float, default=0.0)
     ap.add_argument("--depth-unit-scale", type=float, default=1.0)
     ap.add_argument("--request-timeout-s", type=float, default=10.0)
+    ap.add_argument("--goal-ee-xyz", type=str, default="")
     ap.add_argument("--report-json", type=str, default="")
     ap.add_argument("--print-actions", action="store_true")
     args = ap.parse_args()
+
+    goal_ee_xyz = None
+    if str(args.goal_ee_xyz).strip():
+        parts = [p.strip() for p in str(args.goal_ee_xyz).split(",") if p.strip()]
+        if len(parts) != 3:
+            raise ValueError("--goal-ee-xyz must be 3 comma-separated floats")
+        goal_ee_xyz = [float(x) for x in parts]
+    args.goal_ee_xyz = goal_ee_xyz
+
     asyncio.run(run(args))
 
 

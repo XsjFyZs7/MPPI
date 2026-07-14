@@ -20,6 +20,8 @@ class ObsPCL:
     q: List[float]
     gripper: float
 
+    goal_ee_xyz: Optional[List[float]] = None
+
     rgb_codec: Optional[str] = None
     rgb_bytes: Optional[Any] = None
     rgb_shape_hw: Optional[List[int]] = None
@@ -65,6 +67,9 @@ class ObsPCL:
         if self.depth_back is not None:
             payload["depth_back"] = self.depth_back
 
+        if self.goal_ee_xyz is not None:
+            payload["goal_ee_xyz"] = [float(x) for x in list(self.goal_ee_xyz)]
+
         if self.cam_id is not None:
             payload["cam_id"] = str(self.cam_id)
         if self.intrinsics is not None:
@@ -85,6 +90,11 @@ class ObsPCL:
             step_id=int(payload["step_id"]),
             q=list(payload["q"]),
             gripper=float(payload["gripper"]),
+            goal_ee_xyz=(
+                [float(x) for x in payload["goal_ee_xyz"]]
+                if "goal_ee_xyz" in payload and isinstance(payload["goal_ee_xyz"], list)
+                else None
+            ),
             rgb_codec=(str(payload["rgb_codec"]) if "rgb_codec" in payload and payload["rgb_codec"] is not None else None),
             rgb_bytes=(payload.get("rgb_bytes", None)),
             rgb_shape_hw=(

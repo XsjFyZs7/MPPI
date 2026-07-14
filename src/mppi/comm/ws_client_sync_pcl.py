@@ -98,6 +98,7 @@ async def infer_once(
     gripper: float,
     step_id: int,
     cameras: Dict[str, Dict[str, Any]],
+    goal_ee_xyz: Optional[list[float]] = None,
     primary_cam_id: str = "back",
 ) -> Dict[str, Any]:
     websockets = _require_websockets()
@@ -111,6 +112,7 @@ async def infer_once(
         step_id=int(step_id),
         q=list(q),
         gripper=float(gripper),
+        goal_ee_xyz=list(goal_ee_xyz) if goal_ee_xyz is not None else None,
         cam_id=str(primary_cam_id),
         depth_unit_scale=float(cameras[str(primary_cam_id)].get("depth_unit_scale", 1.0)),
         cameras={str(k): dict(v) for k, v in dict(cameras).items()},
@@ -154,6 +156,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     ap.add_argument("--gripper", type=float, default=0.0)
     ap.add_argument("--step-id", type=int, default=0)
     ap.add_argument("--initial-q", type=str, default="")
+    ap.add_argument("--goal-ee-xyz", type=str, default="")
     ap.add_argument("--print-actions", action="store_true")
     args = ap.parse_args(argv)
 
@@ -178,6 +181,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         "side": _camera_payload(rgb=np.asarray(rgb_side), depth=np.asarray(depth_side), depth_unit_scale=scale_side),
     }
 
+    goal_ee_xyz = None
+    if str(args.goal_ee_xyz).strip():
+        parts = [p.strip() for p in str(args.goal_ee_xyz).split(",") if p.strip()]
+        if len(parts) != 3:
+            raise ValueError("--goal-ee-xyz must be 3 comma-separated floats")
+        goal_ee_xyz = [float(x) for x in parts]
+
     cfg = ClientConfig(url=str(args.url), request_timeout_s=float(args.request_timeout_s))
     payload = asyncio.run(
         infer_once(
@@ -186,6 +196,7 @@ def main(argv: Optional[list[str]] = None) -> None:
             gripper=float(args.gripper),
             step_id=int(args.step_id),
             cameras=cameras,
+            goal_ee_xyz=goal_ee_xyz,
             primary_cam_id="back",
         )
     )

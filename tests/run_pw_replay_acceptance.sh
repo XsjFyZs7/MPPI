@@ -39,6 +39,7 @@ SLEEP_S="${SLEEP_S:-0.0}"
 GRIPPER="${GRIPPER:-0.0}"
 DEPTH_UNIT_SCALE="${DEPTH_UNIT_SCALE:-1.0}"
 REQUEST_TIMEOUT_S="${REQUEST_TIMEOUT_S:-10}"
+GOAL_EE_XYZ="${GOAL_EE_XYZ:-0.55,0.00,0.20}"
 
 mkdir -p "${OUT_ROOT}"
 rm -rf "${ACCEPT_DIR}"
@@ -92,6 +93,11 @@ run_server() {
 
   export MPPI_POLICY="${MPPI_POLICY:-mppi_joint}"
   export MPPI_OPEN_LOOP_HORIZON="${MPPI_OPEN_LOOP_HORIZON:-11}"
+  export MPPI_USE_CUROBO_COLLISION="${MPPI_USE_CUROBO_COLLISION:-0}"
+  export MPPI_W_SMOOTH="${MPPI_W_SMOOTH:-0.0}"
+  export MPPI_W_ACTION="${MPPI_W_ACTION:-0.0}"
+  export MPPI_W_JOINT_LIMIT="${MPPI_W_JOINT_LIMIT:-0.0}"
+  export MPPI_W_EE_POS="${MPPI_W_EE_POS:-1.0}"
 
   export MPPI_PW_MODEL_PATH="${MPPI_PW_MODEL_PATH:-/home/models/PointWorld/PointWorld_models/large-droid/model-best.pt}"
   export MPPI_PW_COTRACKER_CKPT="${MPPI_PW_COTRACKER_CKPT:-/home/models/Co-tracker/scaled_online.pth}"
@@ -181,6 +187,7 @@ run_replay() {
     --gripper "${GRIPPER}"
     --depth-unit-scale "${DEPTH_UNIT_SCALE}"
     --request-timeout-s "${REQUEST_TIMEOUT_S}"
+    --goal-ee-xyz "${GOAL_EE_XYZ}"
     --report-json "${REPORT_JSON}"
   )
 
@@ -222,6 +229,8 @@ checks = [
     ("scene_visibility", all(bool(r.get("has_scene_visibility")) for r in rows)),
     ("scene_depth_valid_mask", all(bool(r.get("has_scene_depth_valid_mask")) for r in rows)),
     ("runtime_policy", all(bool(r.get("has_runtime_policy")) for r in rows)),
+    ("goal_ee_xyz", all(bool(r.get("has_goal_ee_xyz")) for r in rows)),
+    ("goal_error_final_m", all(r.get("goal_error_final_m") is not None for r in rows)),
 ]
 
 if profile != "no_pw":

@@ -150,6 +150,7 @@ def _get_joint_solver(open_loop_horizon: int) -> JointMPPISolver:
         scene_track_match_center_dist_m=float(os.getenv("MPPI_SCENE_TRACK_MATCH_CENTER_DIST_M", "0.10")),
         scene_track_match_iou_min=float(os.getenv("MPPI_SCENE_TRACK_MATCH_IOU_MIN", "0.05")),
         min_effective_samples_ratio=float(os.getenv("MPPI_MIN_EFFECTIVE_SAMPLES_RATIO", "0.01")),
+        w_ee_pos=float(os.getenv("MPPI_W_EE_POS", "0.0")),
         use_pointworld_cost=_env_bool("MPPI_USE_POINTWORLD_COST", "0"),
         w_pointworld=float(os.getenv("MPPI_W_POINTWORLD", "0.0")),
         pointworld_cost_timeout_ms=float(os.getenv("MPPI_PW_COST_TIMEOUT_MS", "0.0")),
@@ -446,6 +447,8 @@ def _maybe_dump_pointworld_acceptance(
     *,
     pointworld_obs: Optional[Dict[str, Any]],
     step_id: int,
+    goal_ee_xyz: Optional[tuple[float, float, float]] = None,
+    goal_error_final_m: Optional[float] = None,
     pw_cost_debug: Optional[Dict[str, Any]] = None,
     timing_breakdown: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -463,6 +466,9 @@ def _maybe_dump_pointworld_acceptance(
 
     summary: Dict[str, Any] = {
         "step_id": int(step_id),
+        "has_goal_ee_xyz": goal_ee_xyz is not None,
+        "goal_ee_xyz": ([float(goal_ee_xyz[0]), float(goal_ee_xyz[1]), float(goal_ee_xyz[2])] if goal_ee_xyz is not None else None),
+        "goal_error_final_m": (float(goal_error_final_m) if goal_error_final_m is not None and np.isfinite(goal_error_final_m) else None),
         "has_scene_flows": "scene_flows" in pointworld_obs,
         "has_scene_visibility": "scene_visibility" in pointworld_obs,
         "has_scene_depth_valid_mask": "scene_depth_valid_mask" in pointworld_obs,
@@ -1086,6 +1092,18 @@ async def _handle_connection(
             tb["step_id"] = int(getattr(obs, "step_id", -1))
             tb["t_decode_ms"] = (time.perf_counter() - t0) * 1000.0
 
+            q7 = np.asarray(getattr(obs, "q", []), dtype=np.float32).reshape(-1)
+            if int(q7.shape[0]) != 7 or (not bool(np.all(np.isfinite(q7)))):
+                raise ValueError("ObsPCL.q must be 7 finite floats")
+
+            goal_raw = getattr(obs, "goal_ee_xyz", None)
+            if goal_raw is None:
+                raise ValueError("Missing required field: goal_ee_xyz")
+            goal_arr = np.asarray(goal_raw, dtype=np.float32).reshape(-1)
+            if int(goal_arr.shape[0]) != 3 or (not bool(np.all(np.isfinite(goal_arr)))):
+                raise ValueError("ObsPCL.goal_ee_xyz must be 3 finite floats")
+            goal_ee_xyz = (float(goal_arr[0]), float(goal_arr[1]), float(goal_arr[2]))
+
             depth_min_m = _env_f("MPPI_PCL_DEPTH_MIN_M", "0.0")
             depth_max_m = _env_f("MPPI_PCL_DEPTH_MAX_M", "4.0")
             stride = _env_i("MPPI_PCL_STRIDE", "1")
@@ -1263,6 +1281,7 @@ async def _handle_connection(
                 actions = solver.infer_actions(
                     q0=obs.q,
                     gripper=float(obs.gripper),
+                    ee_pos_goal=goal_ee_xyz,
                     pcd_back_cam=pcd_base,
                     pointworld_obs=pw_obs,
                     pointworld_cost_fn=pw_cost_fn,
@@ -1293,6 +1312,8 @@ async def _handle_connection(
                 _maybe_dump_pointworld_acceptance(
                     pointworld_obs=pw_obs,
                     step_id=int(obs.step_id),
+                    goal_ee_xyz=goal_ee_xyz,
+                    goal_error_final_m=float(getattr(solver, "last_goal_error_final_m", float("nan")) or float("nan")),
                     pw_cost_debug=pw_cost_debug,
                     timing_breakdown=tb,
                 )
