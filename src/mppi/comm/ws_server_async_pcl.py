@@ -8,12 +8,13 @@ import os
 import time
 import zlib
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from mppi.mpc.solver import JointMPPIConfig, JointMPPISolver, PointWorldCostFn
+from mppi.mpc.solver import JointMPPIConfig, JointMPPISolver, PointWorldCostFn, _first_device
 from mppi.curobo_ext.check_depth_pcl import (
     load_T_row_major_4x4_yaml,
     load_intrinsics_from_cam_info_yaml,
@@ -43,7 +44,7 @@ from mppi.pointworld_ext.input_config import (
 from mppi.pointworld_ext.query_manager import QueryPointManager, QueryPointManagerConfig
 from mppi.pointworld_ext.scene_flow_builder import OnlineSceneFlowBuilder
 from mppi.pointworld_ext.pointworld_batch_adapter import build_pointworld_batch
-from mppi.pointworld_ext.tracker_interface import CoTrackerOnlinePointTracker
+from mppi.pointworld_ext.tracker_interface import build_cotracker_online_point_tracker
 from mppi.pointworld_ext.wrapper import PointWorldCostModel, PointWorldModelConfig
 from mppi.utils.paths import default_urdf_path, repo_path
 from mppi.pointworld_ext.window_buffer import CameraFrame as PWCameraFrame
@@ -91,6 +92,122 @@ def _env_vec3(name: str, default: str) -> Tuple[float, float, float]:
     return (float(parts[0]), float(parts[1]), float(parts[2]))
 
 
+_STARTUP_NOTICES: set[str] = set()
+
+
+def _print_once(key: str, msg: str) -> None:
+    if str(key) in _STARTUP_NOTICES:
+        return
+    _STARTUP_NOTICES.add(str(key))
+    print(msg, flush=True)
+
+
+@lru_cache(maxsize=1)
+def _cuda_runtime_available() -> bool:
+    if _env_bool("MPPI_FORCE_NO_CUDA", "0"):
+        return False
+
+    visible = os.getenv("CUDA_VISIBLE_DEVICES", None)
+    if visible is not None and visible.strip().lower() in ("", "-1", "none", "null", "void"):
+        return False
+
+    try:
+        import torch  # type: ignore
+
+        cuda = getattr(torch, "cuda", None)
+        if cuda is None:
+            return False
+        is_available = getattr(cuda, "is_available", None)
+        if callable(is_available) and not bool(is_available()):
+            return False
+        device_count = getattr(cuda, "device_count", None)
+        if callable(device_count):
+            return int(device_count()) > 0
+        return bool(callable(is_available))
+    except Exception:
+        return False
+
+
+def _allow_cpu_curobo() -> bool:
+    return _env_bool("MPPI_ALLOW_CPU_CUROBO", "0")
+
+
+def _allow_cpu_pointworld() -> bool:
+    return _env_bool("MPPI_ALLOW_CPU_POINTWORLD", "0")
+
+
+def _effective_use_curobo_collision() -> bool:
+    enabled = _env_bool("MPPI_USE_CUROBO_COLLISION", "0")
+    if not enabled:
+        return False
+    if _cuda_runtime_available() or _allow_cpu_curobo():
+        return True
+    _print_once(
+        "disable_curobo_no_cuda",
+        "[pcl_server] CUDA is not available; disabling MPPI_USE_CUROBO_COLLISION for CPU-only inference.",
+    )
+    return False
+
+
+def _effective_pointworld_enabled() -> bool:
+    enabled = _env_bool("MPPI_PW_ENABLE", "0")
+    if not enabled:
+        return False
+    if _cuda_runtime_available() or _allow_cpu_pointworld():
+        return True
+    _print_once(
+        "disable_pointworld_no_cuda",
+        "[pcl_server] CUDA is not available; disabling MPPI_PW_ENABLE for CPU-only inference.",
+    )
+    return False
+
+
+def _effective_use_pointworld_cost() -> bool:
+    enabled = _env_bool("MPPI_USE_POINTWORLD_COST", "0")
+    if not enabled:
+        return False
+    if _cuda_runtime_available() or _allow_cpu_pointworld():
+        return True
+    _print_once(
+        "disable_pointworld_cost_no_cuda",
+        "[pcl_server] CUDA is not available; disabling MPPI_USE_POINTWORLD_COST for CPU-only inference.",
+    )
+    return False
+
+
+def _default_num_samples() -> str:
+    if _cuda_runtime_available():
+        return "256"
+    return os.getenv("MPPI_CPU_NUM_SAMPLES", "32")
+
+
+def _effective_scene_from_pcd_enabled(policy: str) -> bool:
+    if str(policy) != "mppi_joint":
+        return False
+    return (
+        _effective_use_curobo_collision()
+        and _env_bool("MPPI_SCENE_FROM_PCD_BACK_CAM", "0")
+        and float(os.getenv("MPPI_W_SCENE_COLLISION", "1.0")) > 0.0
+    )
+
+
+def _request_needs_pcd(policy: str) -> bool:
+    return _env_bool("MPPI_PCL_SAVE_PCD", "0") or _effective_scene_from_pcd_enabled(policy)
+
+
+def _request_needs_camera_decode(policy: str, pw: Optional[object]) -> bool:
+    pw_enabled = bool(pw is not None and bool(getattr(pw, "enabled", False)))
+    return pw_enabled or _request_needs_pcd(policy)
+
+
+def _tracker_device_summary(tracker: object) -> str:
+    devices = getattr(tracker, "devices", None)
+    if devices:
+        return ",".join(str(d) for d in tuple(devices))
+    device = getattr(tracker, "_device", "")
+    return str(device) if str(device) else "unknown"
+
+
 _JOINT_SOLVERS: dict[int, JointMPPISolver] = {}
 
 
@@ -103,7 +220,7 @@ def _get_joint_solver(open_loop_horizon: int) -> JointMPPISolver:
 
     cfg = JointMPPIConfig(
         horizon=h,
-        num_samples=int(os.getenv("MPPI_NUM_SAMPLES", "256")),
+        num_samples=int(os.getenv("MPPI_NUM_SAMPLES", _default_num_samples())),
         infer_budget_ms=float(os.getenv("MPPI_INFER_BUDGET_MS", "0.0")),
         budget_max_dynamic_cuboids=int(os.getenv("MPPI_BUDGET_MAX_DYNAMIC_CUBOIDS", "0")),
         debug_cost_stats=_env_bool("MPPI_DEBUG_COST_STATS", "0"),
@@ -114,7 +231,7 @@ def _get_joint_solver(open_loop_horizon: int) -> JointMPPISolver:
         w_smooth=float(os.getenv("MPPI_W_SMOOTH", "1.0")),
         w_action=float(os.getenv("MPPI_W_ACTION", "0.01")),
         w_joint_limit=float(os.getenv("MPPI_W_JOINT_LIMIT", "50.0")),
-        use_curobo_collision=_env_bool("MPPI_USE_CUROBO_COLLISION", "0"),
+        use_curobo_collision=_effective_use_curobo_collision(),
         w_scene_collision=float(os.getenv("MPPI_W_SCENE_COLLISION", "1.0")),
         w_self_collision=float(os.getenv("MPPI_W_SELF_COLLISION", os.getenv("MPPI_W_SCENE_COLLISION", "1.0"))),
         curobo_device=str(os.getenv("MPPI_CUROBO_DEVICE", "cuda:0")),
@@ -151,7 +268,7 @@ def _get_joint_solver(open_loop_horizon: int) -> JointMPPISolver:
         scene_track_match_iou_min=float(os.getenv("MPPI_SCENE_TRACK_MATCH_IOU_MIN", "0.05")),
         min_effective_samples_ratio=float(os.getenv("MPPI_MIN_EFFECTIVE_SAMPLES_RATIO", "0.01")),
         w_ee_pos=float(os.getenv("MPPI_W_EE_POS", "0.0")),
-        use_pointworld_cost=_env_bool("MPPI_USE_POINTWORLD_COST", "0"),
+        use_pointworld_cost=_effective_use_pointworld_cost(),
         w_pointworld=float(os.getenv("MPPI_W_POINTWORLD", "0.0")),
         pointworld_cost_timeout_ms=float(os.getenv("MPPI_PW_COST_TIMEOUT_MS", "0.0")),
         urdf_path=str(urdf_path),
@@ -908,7 +1025,7 @@ class _PointWorldRuntime:
 
 
 def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
-    if not _env_bool("MPPI_PW_ENABLE", "0"):
+    if not _effective_pointworld_enabled():
         return None
 
     ckpt = os.getenv("MPPI_PW_COTRACKER_CKPT", "").strip()
@@ -970,11 +1087,17 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
 
     window = PointWorldWindowBuffer(window_size=11)
     query_manager = QueryPointManager(cfg=QueryPointManagerConfig(max_query_points_per_camera=int(max_q), min_track_confidence=float(min_conf), rng_seed=int(rng_seed)))
-    tracker = CoTrackerOnlinePointTracker(checkpoint=str(ckpt), window_len=11, device=device)
+    tracker = build_cotracker_online_point_tracker(
+        checkpoint=str(ckpt),
+        window_len=11,
+        device=device,
+        iters=int(os.getenv("MPPI_PW_COTRACKER_ITERS", "6")),
+    )
     builder = OnlineSceneFlowBuilder(cfg=cfg, window_buffer=window, tracker=tracker, query_manager=query_manager)
+    print(f"[pcl_server] pointworld_tracker_devices={_tracker_device_summary(tracker)}")
 
     cost_model: Optional[PointWorldCostModel] = None
-    if _env_bool("MPPI_USE_POINTWORLD_COST", "0"):
+    if _effective_use_pointworld_cost():
         model_path = os.getenv("MPPI_PW_MODEL_PATH", "").strip()
         if not model_path:
             raise ValueError("MPPI_PW_MODEL_PATH is required when MPPI_USE_POINTWORLD_COST=1")
@@ -1008,13 +1131,15 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
                 seed=int(os.getenv("MPPI_PW_SEED", "1")),
                 disable_compile=_env_bool("MPPI_PW_DISABLE_COMPILE", "1"),
                 eval_batch_size=int(os.getenv("MPPI_PW_EVAL_BATCH_SIZE", "32")),
+                dist2robot_mode=str(os.getenv("MPPI_PW_DIST2ROBOT_MODE", "t0_repeat")),
                 cost=cost_cfg,
             )
         )
         print(
             "[pcl_server] pointworld_cost_devices="
             f"{','.join(cost_model._devices)} robot_devices={','.join(cost_model._robot_devices)} "
-            f"replicas={len(cost_model._replicas)} eval_batch_size={cost_model.cfg.eval_batch_size}"
+            f"replicas={len(cost_model._replicas)} eval_batch_size={cost_model.cfg.eval_batch_size} "
+            f"dist2robot_mode={cost_model._dist2robot_mode}"
         )
 
     rt = _PointWorldRuntime(
@@ -1104,89 +1229,79 @@ async def _handle_connection(
                 raise ValueError("ObsPCL.goal_ee_xyz must be 3 finite floats")
             goal_ee_xyz = (float(goal_arr[0]), float(goal_arr[1]), float(goal_arr[2]))
 
-            depth_min_m = _env_f("MPPI_PCL_DEPTH_MIN_M", "0.0")
-            depth_max_m = _env_f("MPPI_PCL_DEPTH_MAX_M", "4.0")
-            stride = _env_i("MPPI_PCL_STRIDE", "1")
-
-            primary_cam_id = "back"
-
             pw_cameras: Dict[str, PWCameraFrame] = {}
             intr_by_cam: Dict[str, Any] = {}
             T_by_cam: Dict[str, Any] = {}
             depth_unit_scale_by_cam: Dict[str, float] = {}
+            pcd_base: Optional[Dict[str, Any]] = None
 
-            rgb_primary = None
-            depth_primary = None
-            intr_primary = None
-            T_primary = None
             depth_unit_scale_primary = float(obs.depth_unit_scale) if obs.depth_unit_scale is not None else _env_f("MPPI_PCL_DEPTH_UNIT_SCALE", "1.0")
+            need_camera_decode = _request_needs_camera_decode(cfg.policy, pw)
+            need_pcd = _request_needs_pcd(cfg.policy)
 
             cams_payload = getattr(obs, "cameras", None)
-            if not (isinstance(cams_payload, dict) and cams_payload):
-                raise ValueError("This server requires ObsPCL.cameras with back+side. Use tests/pw_replay_acceptance.py or implement a dual-view client.")
+            if need_camera_decode:
+                if not (isinstance(cams_payload, dict) and cams_payload):
+                    raise ValueError("This server requires ObsPCL.cameras with back+side when perception costs or PCD save are enabled.")
 
-            for need in REQUIRED_CAM_IDS:
-                if str(need) not in cams_payload:
-                    raise ValueError(f"Missing required camera in payload: {need}")
+                for need in REQUIRED_CAM_IDS:
+                    if str(need) not in cams_payload:
+                        raise ValueError(f"Missing required camera in payload: {need}")
 
-            t_cam0 = time.perf_counter()
-            for cam_name_raw, cam_pl in cams_payload.items():
-                cam_name = str(cam_name_raw)
-                if not isinstance(cam_pl, dict):
-                    raise ValueError(f"cameras[{cam_name}] must be a dict")
+                t_cam0 = time.perf_counter()
+                for cam_name in REQUIRED_CAM_IDS:
+                    cam_pl = cams_payload[str(cam_name)]
+                    if not isinstance(cam_pl, dict):
+                        raise ValueError(f"cameras[{cam_name}] must be a dict")
 
-                intr_i, T_i = parse_obs_camera_params(
-                    cam_id=cam_name,
-                    intrinsics=(dict(cam_pl["intrinsics"]) if "intrinsics" in cam_pl and cam_pl["intrinsics"] is not None else None),
-                    T_base_cam=(cam_pl.get("T_base_cam", None)),
-                    cam_configs=cam_configs,
-                )
+                    intr_i, T_i = parse_obs_camera_params(
+                        cam_id=str(cam_name),
+                        intrinsics=(dict(cam_pl["intrinsics"]) if "intrinsics" in cam_pl and cam_pl["intrinsics"] is not None else None),
+                        T_base_cam=(cam_pl.get("T_base_cam", None)),
+                        cam_configs=cam_configs,
+                    )
 
-                if cam_pl.get("rgb_bytes", None) is not None:
-                    rgb_i = _decode_rgb(codec=(cam_pl.get("rgb_codec", None)), data=cam_pl.get("rgb_bytes", None))
-                elif cam_pl.get("rgb_back", None) is not None:
-                    rgb_i = np.asarray(cam_pl.get("rgb_back", None))
-                else:
-                    raise ValueError(f"Missing rgb for camera {cam_name}")
+                    if cam_pl.get("rgb_bytes", None) is not None:
+                        rgb_i = _decode_rgb(codec=(cam_pl.get("rgb_codec", None)), data=cam_pl.get("rgb_bytes", None))
+                    elif cam_pl.get("rgb_back", None) is not None:
+                        rgb_i = np.asarray(cam_pl.get("rgb_back", None))
+                    else:
+                        raise ValueError(f"Missing rgb for camera {cam_name}")
 
-                if cam_pl.get("depth_bytes", None) is not None:
-                    depth_i = _decode_depth(codec=(cam_pl.get("depth_codec", None)), data=cam_pl.get("depth_bytes", None))
-                elif cam_pl.get("depth_back", None) is not None:
-                    depth_i = np.asarray(cam_pl.get("depth_back", None))
-                else:
-                    raise ValueError(f"Missing depth for camera {cam_name}")
+                    if cam_pl.get("depth_bytes", None) is not None:
+                        depth_i = _decode_depth(codec=(cam_pl.get("depth_codec", None)), data=cam_pl.get("depth_bytes", None))
+                    elif cam_pl.get("depth_back", None) is not None:
+                        depth_i = np.asarray(cam_pl.get("depth_back", None))
+                    else:
+                        raise ValueError(f"Missing depth for camera {cam_name}")
 
-                rgb_i, depth_i, intr_i = _resize_rgbd_to_contract(rgb=np.asarray(rgb_i), depth=np.asarray(depth_i), intr=intr_i)
+                    rgb_i, depth_i, intr_i = _resize_rgbd_to_contract(rgb=np.asarray(rgb_i), depth=np.asarray(depth_i), intr=intr_i)
 
-                intr_pw = PWPinholeIntrinsics(fx=float(intr_i.fx), fy=float(intr_i.fy), cx=float(intr_i.cx), cy=float(intr_i.cy))
-                pw_cameras[cam_name] = PWCameraFrame(
-                    rgb=np.asarray(rgb_i),
-                    depth=np.asarray(depth_i),
-                    intrinsics=intr_pw,
-                    extrinsics=np.asarray(T_i, dtype=np.float32).reshape(4, 4),
-                )
+                    intr_pw = PWPinholeIntrinsics(fx=float(intr_i.fx), fy=float(intr_i.fy), cx=float(intr_i.cx), cy=float(intr_i.cy))
+                    pw_cameras[str(cam_name)] = PWCameraFrame(
+                        rgb=np.asarray(rgb_i),
+                        depth=np.asarray(depth_i),
+                        intrinsics=intr_pw,
+                        extrinsics=np.asarray(T_i, dtype=np.float32).reshape(4, 4),
+                    )
 
-                intr_by_cam[cam_name] = intr_i
-                T_by_cam[cam_name] = T_i
-                depth_unit_scale_by_cam[cam_name] = (
-                    float(cam_pl["depth_unit_scale"])
-                    if "depth_unit_scale" in cam_pl and cam_pl["depth_unit_scale"] is not None
-                    else depth_unit_scale_primary
-                )
+                    intr_by_cam[str(cam_name)] = intr_i
+                    T_by_cam[str(cam_name)] = T_i
+                    depth_unit_scale_by_cam[str(cam_name)] = (
+                        float(cam_pl["depth_unit_scale"])
+                        if "depth_unit_scale" in cam_pl and cam_pl["depth_unit_scale"] is not None
+                        else depth_unit_scale_primary
+                    )
 
-                if cam_name == primary_cam_id:
-                    rgb_primary = np.asarray(rgb_i)
-                    depth_primary = np.asarray(depth_i)
-                    intr_primary = intr_i
-                    T_primary = T_i
-                    depth_unit_scale_primary = float(depth_unit_scale_by_cam[cam_name])
+                    if str(cam_name) == "back":
+                        depth_unit_scale_primary = float(depth_unit_scale_by_cam[str(cam_name)])
 
-            if rgb_primary is None or depth_primary is None or intr_primary is None or T_primary is None:
-                raise ValueError("Missing primary camera data")
+                tb["t_cameras_ms"] = (time.perf_counter() - t_cam0) * 1000.0
+            else:
+                tb["t_cameras_ms"] = 0.0
+                tb["perception_fast_path"] = "no_camera_decode"
 
-            tb["t_cameras_ms"] = (time.perf_counter() - t_cam0) * 1000.0
-
-            if pw is not None and bool(pw.enabled):
+            if need_camera_decode and pw is not None and bool(pw.enabled):
                 ts_s = float(obs.t_client_send_ns) * 1e-9
                 t_pw0 = time.perf_counter()
                 try:
@@ -1207,40 +1322,48 @@ async def _handle_connection(
                     tb["pw_build_error_message"] = str(e)
                     pw.reset()
 
-            t_pcd0 = time.perf_counter()
-            pcd_list: list[Dict[str, Any]] = []
-            for cam_name in REQUIRED_CAM_IDS:
-                pcd_i = rgbd_to_pointcloud_base(
-                    depth=np.asarray(pw_cameras[cam_name].depth),
-                    rgb=np.asarray(pw_cameras[cam_name].rgb),
-                    intr=intr_by_cam[cam_name],
-                    T_base_cam=T_by_cam[cam_name],
-                    depth_unit_scale=float(depth_unit_scale_by_cam.get(cam_name, depth_unit_scale_primary)),
-                    depth_min_m=float(depth_min_m),
-                    depth_max_m=float(depth_max_m),
-                    stride=int(stride),
-                    roi_min=None,
-                    roi_max=None,
-                    voxel_size_m=0.0,
-                )
-                pcd_list.append(dict(pcd_i))
+            if need_pcd:
+                depth_min_m = _env_f("MPPI_PCL_DEPTH_MIN_M", "0.0")
+                depth_max_m = _env_f("MPPI_PCL_DEPTH_MAX_M", "4.0")
+                stride = _env_i("MPPI_PCL_STRIDE", "1")
 
-            pts_list = [np.asarray(p["points"], dtype=np.float32) for p in pcd_list if np.asarray(p["points"]).size > 0]
-            pts = np.concatenate(pts_list, axis=0) if pts_list else np.zeros((0, 3), dtype=np.float32)
-            out_pcd: Dict[str, Any] = {"points": np.ascontiguousarray(pts)}
+                t_pcd0 = time.perf_counter()
+                pcd_list: list[Dict[str, Any]] = []
+                for cam_name in REQUIRED_CAM_IDS:
+                    pcd_i = rgbd_to_pointcloud_base(
+                        depth=np.asarray(pw_cameras[cam_name].depth),
+                        rgb=np.asarray(pw_cameras[cam_name].rgb),
+                        intr=intr_by_cam[cam_name],
+                        T_base_cam=T_by_cam[cam_name],
+                        depth_unit_scale=float(depth_unit_scale_by_cam.get(cam_name, depth_unit_scale_primary)),
+                        depth_min_m=float(depth_min_m),
+                        depth_max_m=float(depth_max_m),
+                        stride=int(stride),
+                        roi_min=None,
+                        roi_max=None,
+                        voxel_size_m=0.0,
+                    )
+                    pcd_list.append(dict(pcd_i))
 
-            if all("colors" in p for p in pcd_list):
-                col_list = [np.asarray(p["colors"], dtype=np.uint8) for p in pcd_list if np.asarray(p["points"]).size > 0]
-                cols = np.concatenate(col_list, axis=0) if col_list else np.zeros((0, 3), dtype=np.uint8)
-                out_pcd["colors"] = np.ascontiguousarray(cols)
+                pts_list = [np.asarray(p["points"], dtype=np.float32) for p in pcd_list if np.asarray(p["points"]).size > 0]
+                pts = np.concatenate(pts_list, axis=0) if pts_list else np.zeros((0, 3), dtype=np.float32)
+                out_pcd: Dict[str, Any] = {"points": np.ascontiguousarray(pts)}
 
-            pcd_base = out_pcd
+                if all("colors" in p for p in pcd_list):
+                    col_list = [np.asarray(p["colors"], dtype=np.uint8) for p in pcd_list if np.asarray(p["points"]).size > 0]
+                    cols = np.concatenate(col_list, axis=0) if col_list else np.zeros((0, 3), dtype=np.uint8)
+                    out_pcd["colors"] = np.ascontiguousarray(cols)
 
-            try:
-                tb["pcd_points"] = int(np.asarray(pcd_base.get("points")).shape[0]) if isinstance(pcd_base, dict) and "points" in pcd_base else 0
-            except Exception:
+                pcd_base = out_pcd
+
+                try:
+                    tb["pcd_points"] = int(np.asarray(pcd_base.get("points")).shape[0]) if isinstance(pcd_base, dict) and "points" in pcd_base else 0
+                except Exception:
+                    tb["pcd_points"] = 0
+                tb["t_pcd_ms"] = (time.perf_counter() - t_pcd0) * 1000.0
+            else:
                 tb["pcd_points"] = 0
-            tb["t_pcd_ms"] = (time.perf_counter() - t_pcd0) * 1000.0
+                tb["t_pcd_ms"] = 0.0
 
             timing_policy = cfg.policy
             t_solve0 = time.perf_counter()
@@ -1288,12 +1411,19 @@ async def _handle_connection(
                 )
 
                 tb["t_solver_ms"] = (time.perf_counter() - t_solve0) * 1000.0
+                curobo_eval_ranges = getattr(solver, "last_curobo_eval_ranges", ())
+                if curobo_eval_ranges:
+                    tb["curobo_eval_ranges"] = [dict(x) for x in tuple(curobo_eval_ranges)]
 
                 pw_cost_debug: Dict[str, Any] = {
                     "enabled": bool(getattr(solver, "last_pw_enabled", False)),
                     "reason": str(getattr(solver, "last_pw_reason", "") or ""),
                     "ms": float(getattr(solver, "last_pw_ms", 0.0) or 0.0),
                 }
+                if pw_cost_fn0 is not None:
+                    eval_ranges = getattr(pw_cost_fn0, "last_eval_ranges", ())
+                    if eval_ranges:
+                        pw_cost_debug["eval_ranges"] = [dict(x) for x in tuple(eval_ranges)]
 
                 if pw is not None and bool(getattr(pw, "enabled", False)) and getattr(pw, "cost_model", None) is not None:
                     timing = getattr(pw.cost_model, "last_timing", None)
@@ -1318,12 +1448,17 @@ async def _handle_connection(
                     timing_breakdown=tb,
                 )
 
-                if _env_bool("MPPI_PCL_SAVE_PCD", "0") and getattr(solver, "cfg", None) is not None:
+                if (
+                    _env_bool("MPPI_PCL_SAVE_PCD", "0")
+                    and getattr(solver, "cfg", None) is not None
+                    and bool(getattr(solver.cfg, "use_curobo_collision", False))
+                    and isinstance(pcd_base, dict)
+                ):
                     scfg = solver.cfg
 
                     checker = get_curobo_collision_checker(
                         CuRoboCollisionConfig(
-                            device=str(scfg.curobo_device),
+                            device=_first_device(scfg.curobo_device),
                             robot_yaml=str(scfg.curobo_robot_yaml),
                             urdf_path=str(scfg.urdf_path),
                             tool_frame=str(scfg.curobo_tool_frame),
@@ -1468,8 +1603,9 @@ async def serve(cfg: ServerConfig) -> None:
     cam_configs = _load_cam_configs_from_env(cfg.cam_id)
     pw = _build_pointworld_runtime()
 
+    needs_camera_configs = _request_needs_camera_decode(cfg.policy, pw)
     missing = [c for c in REQUIRED_CAM_IDS if str(c) not in cam_configs]
-    if missing:
+    if needs_camera_configs and missing:
         name_list = ",".join(str(x) for x in missing)
         raise RuntimeError(
             f"Missing cam config(s): {name_list}. "
@@ -1482,6 +1618,8 @@ async def serve(cfg: ServerConfig) -> None:
         dump_dir = os.getenv("MPPI_PW_ACCEPTANCE_DUMP_DIR", "").strip()
         print(f"[pcl_server] boot host={cfg.host} port={cfg.port} policy={cfg.policy} horizon={cfg.open_loop_horizon} cam_id={cfg.cam_id}")
         print(f"[pcl_server] required_cams={list(REQUIRED_CAM_IDS)} loaded_cam_configs={sorted(cam_configs.keys())}")
+        print(f"[pcl_server] needs_camera_decode={needs_camera_configs} cuda_available={_cuda_runtime_available()} default_num_samples={_default_num_samples()}")
+        print(f"[pcl_server] curobo_device={os.getenv('MPPI_CUROBO_DEVICE', 'cuda:0')}")
         print(f"[pcl_server] pointworld_enabled={pw_enabled} acceptance_dump_dir={dump_dir if dump_dir else 'disabled'}")
 
     async def handler(ws: Any) -> None:

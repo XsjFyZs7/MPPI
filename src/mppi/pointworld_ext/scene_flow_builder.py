@@ -19,7 +19,7 @@ from mppi.pointworld_ext.geometry import (
 )
 from mppi.pointworld_ext.input_config import PointWorldInputConfig
 from mppi.pointworld_ext.query_manager import QueryPointManager
-from mppi.pointworld_ext.tracker_interface import OnlinePointTracker
+from mppi.pointworld_ext.tracker_interface import OnlinePointTracker, TrackWindowRequest
 from mppi.pointworld_ext.window_buffer import PointWorldWindowBuffer
 
 
@@ -406,6 +406,8 @@ class OnlineSceneFlowBuilder:
         per_cam_depth_valid: Dict[str, np.ndarray] = {}
         per_cam_conf: Dict[str, np.ndarray] = {}
         per_cam_cols: Dict[str, np.ndarray] = {}
+        per_cam_prepared: Dict[str, dict[str, object]] = {}
+        track_requests: list[TrackWindowRequest] = []
 
         ee_spheres_link = _as_spheres_array(self.cfg.robot_filter.ee_filter_spheres)
 
@@ -491,9 +493,46 @@ class OnlineSceneFlowBuilder:
             cols0 = _sample_rgb_at_uv(rgb0, q0)
             ms_cols0 = (time.perf_counter() - t_cols0) * 1000.0
 
-            t_tr0 = time.perf_counter()
-            track_out = self.tracker.track_window(frames, q0)
-            tr_ms = (time.perf_counter() - t_tr0) * 1000.0
+            per_cam_prepared[str(cam_name)] = {
+                "t_cam0": float(t_cam0),
+                "frames": frames,
+                "q0": q0,
+                "cols0": cols0,
+                "ms_frames": float(ms_frames),
+                "ms_valid0": float(ms_valid0),
+                "ms_ws0": float(ms_ws0),
+                "ms_rm0": float(ms_rm0),
+                "rm0_timing": dict(rm0_timing),
+                "q_ms": float(q_ms),
+                "ms_cols0": float(ms_cols0),
+                "H0": int(H0),
+                "W0": int(W0),
+            }
+            track_requests.append(TrackWindowRequest(key=str(cam_name), frames=frames, query_points=q0))
+
+        t_tr0 = time.perf_counter()
+        track_outputs = self.tracker.track_windows(tuple(track_requests))
+        tr_ms_total = (time.perf_counter() - t_tr0) * 1000.0
+
+        for cam_name in cameras_used:
+            prepared = per_cam_prepared[str(cam_name)]
+            t_cam0 = float(prepared["t_cam0"])
+            q0 = np.asarray(prepared["q0"], dtype=np.float32)
+            cols0 = np.asarray(prepared["cols0"], dtype=np.uint8)
+            ms_frames = float(prepared["ms_frames"])
+            ms_valid0 = float(prepared["ms_valid0"])
+            ms_ws0 = float(prepared["ms_ws0"])
+            ms_rm0 = float(prepared["ms_rm0"])
+            rm0_timing = dict(prepared["rm0_timing"])
+            q_ms = float(prepared["q_ms"])
+            ms_cols0 = float(prepared["ms_cols0"])
+            H0 = int(prepared["H0"])
+            W0 = int(prepared["W0"])
+
+            if str(cam_name) not in track_outputs:
+                raise RuntimeError(f"Tracker did not return output for camera '{cam_name}'")
+            track_out = track_outputs[str(cam_name)]
+            tr_ms = float(tr_ms_total)
 
             uv_tracks = np.asarray(track_out.uv_tracks, dtype=np.float32)
             visibility = np.asarray(track_out.visibility).astype(bool)

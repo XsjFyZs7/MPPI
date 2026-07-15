@@ -12,6 +12,7 @@ from mppi.pointworld_ext.flows import (
     build_scene_features,
     build_scene_features_torch,
     compute_flow_derivatives,
+    normalize_dist2robot_mode,
     prepare_scene_inputs,
 )
 
@@ -83,3 +84,45 @@ def test_build_scene_features_torch_matches_numpy() -> None:
     dist2robot = expected[..., -scene_flows.shape[1]:]
     assert not np.allclose(dist2robot, 0.0)
     assert float(dist2robot.max() - dist2robot.min()) > 1e-4
+
+
+def test_dist2robot_modes() -> None:
+    assert normalize_dist2robot_mode("t0") == "t0_repeat"
+    assert normalize_dist2robot_mode("off") == "none"
+
+    scene_flows = np.zeros((1, 3, 2, 3), dtype=np.float32)
+    scene_flows[0, 0, 0] = [0.0, 0.0, 0.0]
+    scene_flows[0, 0, 1] = [2.0, 0.0, 0.0]
+    scene_colors = np.zeros_like(scene_flows)
+    gripper_positions = np.zeros((1, 3), dtype=np.float32)
+
+    robot_flows = np.zeros((1, 3, 1, 3), dtype=np.float32)
+    robot_flows[0, 0, 0] = [1.0, 0.0, 0.0]
+    robot_flows[0, 1, 0] = [2.0, 0.0, 0.0]
+    robot_flows[0, 2, 0] = [3.0, 0.0, 0.0]
+
+    full = build_scene_features(
+        scene_flows=scene_flows,
+        scene_colors=scene_colors,
+        gripper_positions=gripper_positions,
+        robot_flows=robot_flows,
+        dist2robot_mode="full",
+    )
+    repeat = build_scene_features(
+        scene_flows=scene_flows,
+        scene_colors=scene_colors,
+        gripper_positions=gripper_positions,
+        robot_flows=robot_flows,
+        dist2robot_mode="t0_repeat",
+    )
+    none = build_scene_features(
+        scene_flows=scene_flows,
+        scene_colors=scene_colors,
+        gripper_positions=gripper_positions,
+        robot_flows=robot_flows,
+        dist2robot_mode="none",
+    )
+
+    assert np.allclose(repeat[..., -3:], repeat[..., -3:-2])
+    assert not np.allclose(full[..., -3:], repeat[..., -3:])
+    assert np.allclose(none[..., -3:], 0.0)
