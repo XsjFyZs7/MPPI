@@ -70,6 +70,7 @@ case "${PROFILE}" in
 esac
 
 export MPPI_PW_ENABLE="${MPPI_PW_ENABLE:-1}"
+export MPPI_TEMPERATURE="${MPPI_TEMPERATURE:-0.05}"
 
 if [[ "${PROFILE}" == "no_pw" ]]; then
   export MPPI_USE_POINTWORLD_COST="${MPPI_USE_POINTWORLD_COST:-0}"

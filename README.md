@@ -86,8 +86,8 @@ MPPI_USE_CUROBO_COLLISION=0 MPPI_W_EE_POS=1.0 \
 MPPI_W_SMOOTH=0.0 MPPI_W_ACTION=0.0 MPPI_W_JOINT_LIMIT=0.0 \
 MPPI_PW_MODEL_PATH=/home/models/PointWorld/PointWorld_models/large-droid/model-best.pt \
 MPPI_PW_COTRACKER_CKPT=/home/models/Co-tracker/scaled_online.pth \
-MPPI_PW_MODEL_DEVICE=cuda:0 MPPI_PW_COTRACKER_DEVICE=cuda:0 \
-MPPI_PW_ROBOT_SAMPLER_DEVICE=cuda:0 MPPI_PW_MODEL_DOMAIN=droid \
+MPPI_PW_MODEL_DEVICE=cuda:0,cuda:1 MPPI_PW_COTRACKER_DEVICE=cuda:0,cuda:1 \
+MPPI_PW_ROBOT_SAMPLER_DEVICE=cuda:0,cuda:1 MPPI_PW_MODEL_DOMAIN=droid \
 MPPI_URDF_PATH=/home/wangyuhan/PointWorld/assets/franka_description/franka_panda_robotiq_2f85.urdf \
 MPPI_PW_URDF_PATH=/home/wangyuhan/PointWorld/assets/franka_description/franka_panda_robotiq_2f85.urdf \
 PYTHONPATH=/home/wangyuhan/MPPI/src:/home/wangyuhan/MPPI/third_party/co-tracker:/home/wangyuhan/MPPI/third_party/curobo:/home/wangyuhan/PointWorld:/home/wangyuhan/PointWorld/third_party/dinov3 \
@@ -103,6 +103,37 @@ python3 -m mppi.comm.ws_server_async_pcl \
 - 旧的“只发 `q + cameras`”客户端已过时，不再满足当前 server 契约
 - 打开 PointWorld 后，client timeout 建议 ≥120s
 - 真机实时闭环时，建议用 Franka 侧 runner 替代 `ws_client_sync_pcl.py`；后者仅保留为离线 smoke 工具
+
+### 1.4 多 GPU 推理时间测试
+
+`tests/run_pw_replay_acceptance.sh` 已支持通过 `MPPI_PW_MULTI_GPU_DEVICES=cuda:0,cuda:1,...` 一次性设置 `MPPI_PW_MODEL_DEVICE`、`MPPI_PW_COTRACKER_DEVICE`、`MPPI_PW_ROBOT_SAMPLER_DEVICE`；如需测试 cuRobo collision 多卡，再额外设置 `MPPI_CUROBO_DEVICE=cuda:0,cuda:1,...`。
+
+PointWorld cost + CoTracker 双卡时间测试（64 x 11，推荐跳过 warmup）
+```bash
+EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
+DUAL_VIEW=1 GOAL_EE_XYZ=0.55,0.00,0.20 \
+START_IDX=10 MAX_STEPS=20 REQUEST_TIMEOUT_S=120 \
+MPPI_NUM_SAMPLES=64 MPPI_PW_EVAL_BATCH_SIZE=32 \
+MPPI_PW_MULTI_GPU_DEVICES=cuda:0,cuda:1 \
+bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh all obs_only
+```
+
+PointWorld cost + CoTracker 双卡时间测试（512 x 11）
+```bash
+EPISODE_DIR=/home/datasets/FrankaNav/ep_00152 \
+DUAL_VIEW=1 GOAL_EE_XYZ=0.55,0.00,0.20 \
+START_IDX=10 MAX_STEPS=20 REQUEST_TIMEOUT_S=120 \
+MPPI_NUM_SAMPLES=512 MPPI_PW_EVAL_BATCH_SIZE=32 \
+MPPI_PW_MULTI_GPU_DEVICES=cuda:0,cuda:1 \
+bash /home/wangyuhan/MPPI/tests/run_pw_replay_acceptance.sh all obs_only
+```
+
+如需同时打开 cuRobo collision 多卡，追加：
+```bash
+MPPI_USE_CUROBO_COLLISION=1 MPPI_CUROBO_DEVICE=cuda:0,cuda:1 MPPI_SCENE_FROM_PCD_BACK_CAM=1
+```
+
+时间结果优先看 `${REPORT_JSON}` 里的 `infer_ms.mean/p95`；多卡是否生效可看 server 日志中的 `pointworld_tracker_devices=`、`pointworld_cost_devices=`、`curobo_eval_ranges=`。
 
 ---
 

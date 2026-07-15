@@ -1,0 +1,199 @@
+{
+  "step_id": 40,
+  "has_goal_ee_xyz": true,
+  "goal_ee_xyz": [
+    0.550000011920929,
+    0.0,
+    0.20000000298023224
+  ],
+  "goal_error_final_m": 0.1104411706328392,
+  "has_scene_flows": true,
+  "has_scene_visibility": true,
+  "has_scene_depth_valid_mask": true,
+  "has_task_n_obs": true,
+  "has_task_n_infl": true,
+  "has_runtime_policy": true,
+  "scene_flows_shape": [
+    11,
+    4096,
+    3
+  ],
+  "scene_visibility_shape": [
+    11,
+    4096
+  ],
+  "scene_depth_valid_mask_shape": [
+    11,
+    4096
+  ],
+  "task_n_obs": 2221,
+  "task_n_infl": 3134,
+  "task_selector_reason": "",
+  "runtime_policy": {
+    "seed_robot_mask_enabled": true,
+    "gripper_pose_enabled": true,
+    "task_use_visibility": true,
+    "task_use_depth_valid": true,
+    "task_ablation_mode": "obs_infl",
+    "cooldown_active": false
+  },
+  "pw_cost_debug": {
+    "enabled": true,
+    "reason": "ok",
+    "ms": 2835.4052109643817,
+    "eval_ranges": [
+      {
+        "device": "cuda:0",
+        "start": 0,
+        "end": 128,
+        "samples": 128
+      },
+      {
+        "device": "cuda:1",
+        "start": 128,
+        "end": 256,
+        "samples": 128
+      }
+    ],
+    "timing": {
+      "mode": "multi",
+      "devices": [
+        "cuda:0",
+        "cuda:1"
+      ],
+      "replicas": [
+        {
+          "device": "cuda:0",
+          "B": 128,
+          "chunk_size": 32,
+          "chunks": 4,
+          "t_scene_to_torch_ms": 0.5746288225054741,
+          "t_scene_features_ms": 6.921843625605106,
+          "t_dist2robot_ms": 6.12621009349823,
+          "t_model_ms": 2653.900036588311,
+          "t_reduce_ms": 3.9836857467889786,
+          "t_total_ms": 2670.635784044862,
+          "dist2robot_mode": "t0_repeat",
+          "t_prepare_batch_ms": 70.09145710617304,
+          "t_total_with_prepare_ms": 2740.727241151035,
+          "start": 0,
+          "end": 128,
+          "samples": 128
+        },
+        {
+          "device": "cuda:1",
+          "B": 128,
+          "chunk_size": 32,
+          "chunks": 4,
+          "t_scene_to_torch_ms": 0.7563000544905663,
+          "t_scene_features_ms": 7.072052918374538,
+          "t_dist2robot_ms": 6.278707645833492,
+          "t_model_ms": 2746.323416940868,
+          "t_reduce_ms": 4.640900529921055,
+          "t_total_ms": 2764.737215824425,
+          "dist2robot_mode": "t0_repeat",
+          "t_prepare_batch_ms": 66.45382288843393,
+          "t_total_with_prepare_ms": 2831.191038712859,
+          "start": 128,
+          "end": 256,
+          "samples": 128
+        }
+      ]
+    }
+  },
+  "timing_breakdown": {
+    "request_id": "59813fc4-d7b7-4eaf-84c8-a8c9be7e102a",
+    "step_id": 40,
+    "t_decode_ms": 0.15954207628965378,
+    "t_cameras_ms": 12.274784035980701,
+    "t_pw_build_ms": 874.4571469724178,
+    "pw_build_breakdown": {
+      "t_window_push_ms": 0.026746653020381927,
+      "t_scene_build_ms": 862.4983429908752,
+      "scene_build_breakdown": {
+        "ms_total": 862.3473020270467,
+        "cams": {
+          "back": {
+            "ms_total": 830.3780136629939,
+            "ms_frames": 0.021995045244693756,
+            "ms_valid0": 0.0807642936706543,
+            "ms_workspace0": 7.8559573739767075,
+            "ms_robot_mask0": 10.00618189573288,
+            "ms_project_mask0": 4.612889140844345,
+            "ms_rasterize_mask0": 2.2336486726999283,
+            "ms_morph_mask0": 3.074856474995613,
+            "ms_query": 0.01045316457748413,
+            "ms_sample_rgb0": 0.12629851698875427,
+            "ms_track": 771.0857074707747,
+            "ms_lift": 3.5561295226216316,
+            "ms_lift3d": 1.6330629587173462,
+            "ms_transform": 0.5404464900493622,
+            "ms_ws_filter": 0.7457062602043152,
+            "ms_robot_filter": 0.0,
+            "ms_ee_filter": 0.0,
+            "ms_ok": 0.10820012539625168,
+            "ms_pack": 0.3987010568380356,
+            "ms_stability": 0.16206689178943634,
+            "ms_shift_valid": 0.0727437436580658,
+            "ms_shift_workspace": 7.948894053697586,
+            "ms_shift_robot_mask": 10.14599297195673,
+            "ms_project_mask_shift": 4.707064479589462,
+            "ms_rasterize_mask_shift": 2.2244835272431374,
+            "ms_morph_mask_shift": 3.0959714204072952,
+            "shift_mask_cache_hit": 0,
+            "shift_mask_cache_miss": 1,
+            "ms_advance": 0.7023895159363747,
+            "n_query": 2048,
+            "hw": [
+              180,
+              320
+            ]
+          },
+          "side": {
+            "ms_total": 833.3067167550325,
+            "ms_frames": 0.024888664484024048,
+            "ms_valid0": 0.07132254540920258,
+            "ms_workspace0": 7.988656871020794,
+            "ms_robot_mask0": 9.792064316570759,
+            "ms_project_mask0": 4.2311763390898705,
+            "ms_rasterize_mask0": 2.4552885442972183,
+            "ms_morph_mask0": 3.0178558081388474,
+            "ms_query": 0.009374693036079407,
+            "ms_sample_rgb0": 0.1064622774720192,
+            "ms_track": 771.0857074707747,
+            "ms_lift": 3.199459984898567,
+            "ms_lift3d": 1.3951323926448822,
+            "ms_transform": 0.5100928246974945,
+            "ms_ws_filter": 0.741119496524334,
+            "ms_robot_filter": 0.0,
+            "ms_ee_filter": 0.0,
+            "ms_ok": 0.08513499051332474,
+            "ms_pack": 0.3529619425535202,
+            "ms_stability": 0.15454087406396866,
+            "ms_shift_valid": 0.05763303488492966,
+            "ms_shift_workspace": 7.635110057890415,
+            "ms_shift_robot_mask": 9.117744863033295,
+            "ms_project_mask_shift": 3.7549110129475594,
+            "ms_rasterize_mask_shift": 2.3276563733816147,
+            "ms_morph_mask_shift": 2.9363567009568214,
+            "shift_mask_cache_hit": 0,
+            "shift_mask_cache_miss": 1,
+            "ms_advance": 0.5736974999308586,
+            "n_query": 2048,
+            "hw": [
+              180,
+              320
+            ]
+          }
+        }
+      },
+      "t_build_batch_ms": 0.02081785351037979,
+      "t_gripper_pose_fk_ms": 10.99194586277008,
+      "t_task_selector_ms": 0.7465062662959099
+    },
+    "pcd_points": 0,
+    "t_pcd_ms": 0.0,
+    "t_solver_ms": 2872.9459019377828,
+    "pw_ms": 2835.4052109643817
+  }
+}

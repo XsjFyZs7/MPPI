@@ -22,6 +22,36 @@
 - `t_cameras_ms ≈ 11ms`
 - `t_pcd_ms ≈ 5.6–8.3ms`，`pcd_points ≈ 10.7 万`（反投影 + 拼接不慢）
 
+## B) 三项耗时优化结果（dist2robot + robot mask + 多 GPU）
+
+### B.1 dist2robot（PointWorld cost 特征构造）
+- 优化点：`dist2robot` 改为 `t0_repeat`（只算 `t=0` 一次，然后沿 `T` 维 repeat），离线/线上统一走 torch 特征构造。
+- 优化前：`dist2robot` 属于确定性重算（逐 `t` 计算），在 profiling 中曾出现数百 ms 级波动风险。
+- 优化后：稳定段 `t_dist2robot_ms ≈ 11ms/帧`（单 GPU；`K=256`）。
+
+### B.2 robot mask（PW build 的 seed mask）
+- 优化点：
+  - 去掉逐点 `cv2.circle` 循环，改为“批量栅格化 + dilate/close”。
+  - `FK/mesh->world` 对双视角共享（同一时间点只算一次）。
+  - `shift mask` 支持 `update_every=2` 降频更新（命中缓存帧直接复用）。
+- 优化前：单次 `robot_mask0/shift_robot_mask` 约 `0.4–0.55s`，双视角每帧合计接近 `~2s/帧`。
+- 优化后：稳定段单相机 `ms_robot_mask0 ≈ 9–16ms`；`ms_shift_robot_mask` 在命中缓存帧可降到 `~0.05ms`。
+
+### B.3 build / cost / 端到端 对比（K=256，obs_infl）
+- 单 GPU（做完 dist2robot + robot mask 之后，window ready 稳定段）：
+  - `t_pw_build_ms ≈ 1.64–1.69s/帧`
+  - `pw_ms ≈ 4.48–5.01s/帧`（大头仍是模型前向）
+  - 端到端约 `~6.2–6.7s/帧`
+- 多 GPU（2 卡分片，`cuda:0,cuda:1`）：
+  - `pw_ms ≈ 2.87s/帧`，`t_solver_ms ≈ 2.92s/帧`
+  - `t_pw_build_ms ≈ 0.88s/帧`
+  - 端到端约 `~3.8s/帧`
+  - 相比单 GPU cost：`pw_ms` 加速约 `1.6–1.7×`（非线性，受 build/prepare/reduce/调度开销影响）
+
+### B.4 当前新瓶颈（优化后）
+- build 侧：`ms_track ≈ 0.77s/相机`（双视角约 `~1.5s/帧`），是 `t_pw_build_ms` 的最大头。
+- cost 侧：模型前向 `t_model_ms` 仍是 `pw_ms` 最大头（2 卡时每卡约 `2.7–2.8s`）。
+
 ## 1) 端侧闭环执行时序（按频率消费 action chunk）
 
 ```bash
