@@ -71,6 +71,12 @@ esac
 
 export MPPI_PW_ENABLE="${MPPI_PW_ENABLE:-1}"
 export MPPI_TEMPERATURE="${MPPI_TEMPERATURE:-0.05}"
+export MPPI_NOISE_MODE="${MPPI_NOISE_MODE:-spline}"
+export MPPI_NOISE_NKNOTS="${MPPI_NOISE_NKNOTS:-4}"
+export MPPI_NOISE_DEGREE="${MPPI_NOISE_DEGREE:-3}"
+export MPPI_NOISE_STD_MIN="${MPPI_NOISE_STD_MIN:-0.05}"
+export MPPI_NOISE_STD_MAX="${MPPI_NOISE_STD_MAX:-0.50}"
+export MPPI_NOISE_SCHEDULE="${MPPI_NOISE_SCHEDULE:-linear}"
 
 if [[ "${PROFILE}" == "no_pw" ]]; then
   export MPPI_USE_POINTWORLD_COST="${MPPI_USE_POINTWORLD_COST:-0}"
@@ -251,9 +257,20 @@ if profile != "no_pw":
 if profile == "obs_infl":
     checks.append(("task_n_infl", all(bool(r.get("has_task_n_infl")) for r in rows)))
 
+actions_finite_ok = all(bool(r.get("actions_finite", False)) for r in rows)
+penalty_vals = [float(r.get("joint_limit_penalty_mean")) for r in rows if r.get("joint_limit_penalty_mean") is not None]
+penalty_q95_vals = [float(r.get("joint_limit_penalty_q95")) for r in rows if r.get("joint_limit_penalty_q95") is not None]
+penalty_warn_mean = float(__import__("os").getenv("MPPI_ACCEPT_JL_MEAN_WARN", "0.05"))
+penalty_warn_q95 = float(__import__("os").getenv("MPPI_ACCEPT_JL_Q95_WARN", "0.20"))
+joint_limit_penalty_ok = (not penalty_vals) or (max(penalty_vals) <= penalty_warn_mean and max(penalty_q95_vals or [0.0]) <= penalty_warn_q95)
+checks.append(("actions_finite", actions_finite_ok))
+checks.append(("joint_limit_penalty", joint_limit_penalty_ok))
+
 print("")
 print("== Acceptance Summary ==")
 print("server_rows:", len(rows))
+print("joint_limit_penalty_mean_max:", max(penalty_vals) if penalty_vals else None)
+print("joint_limit_penalty_q95_max:", max(penalty_q95_vals) if penalty_q95_vals else None)
 for name, ok in checks:
     print(f"{name}: {'PASS' if ok else 'FAIL'}")
 

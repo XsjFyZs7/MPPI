@@ -298,6 +298,55 @@ class SceneState:
         ]
 
 
+def _noise_schedule(std_min: float, std_max: float, T: int, mode: str) -> np.ndarray:
+    if T <= 0:
+        return np.zeros((0,), dtype=np.float32)
+    mm = str(mode).strip().lower() or "linear"
+    if mm != "linear":
+        raise ValueError(f"Unsupported MPPI noise schedule: {mode}")
+    if T == 1:
+        return np.asarray([float(std_max)], dtype=np.float32)
+    return np.linspace(float(std_min), float(std_max), num=int(T), dtype=np.float32)
+
+
+def _bspline_basis(n_ctrl: int, degree: int, grid: np.ndarray) -> np.ndarray:
+    p = max(0, min(int(degree), max(0, int(n_ctrl) - 1)))
+    n = int(n_ctrl)
+    knot = np.concatenate([np.zeros((p + 1,), dtype=np.float32), np.linspace(0.0, 1.0, num=max(2, n - p + 1), dtype=np.float32)[1:-1], np.ones((p + 1,), dtype=np.float32)])
+    u = np.asarray(grid, dtype=np.float32).reshape(-1)
+    B = np.zeros((u.shape[0], n), dtype=np.float32)
+    for i in range(n):
+        left = knot[i]
+        right = knot[i + 1]
+        B[:, i] = ((u >= left) & (u < right)).astype(np.float32)
+    B[u >= 1.0, -1] = 1.0
+    for k in range(1, p + 1):
+        Bn = np.zeros_like(B)
+        for i in range(n):
+            d1 = knot[i + k] - knot[i]
+            d2 = knot[i + k + 1] - knot[i + 1]
+            if d1 > 0:
+                Bn[:, i] += ((u - knot[i]) / d1) * B[:, i]
+            if d2 > 0 and (i + 1) < n:
+                Bn[:, i] += ((knot[i + k + 1] - u) / d2) * B[:, i + 1]
+        B = Bn
+    return B.astype(np.float32, copy=False)
+
+
+def _sample_noise(cfg: "JointMPPIConfig", rng: np.random.Generator, K: int, T: int) -> np.ndarray:
+    mode = str(cfg.noise_mode).strip().lower() or "gaussian"
+    if mode == "gaussian":
+        return rng.normal(0.0, float(cfg.noise_std), size=(K, T, 7)).astype(np.float32)
+    if mode != "spline":
+        raise ValueError(f"Unsupported MPPI noise mode: {cfg.noise_mode}")
+    n_ctrl = max(2, int(cfg.noise_nknots))
+    basis = _bspline_basis(n_ctrl, int(cfg.noise_degree), np.linspace(0.0, 1.0, num=max(1, T), dtype=np.float32))
+    ctrl = rng.normal(0.0, 1.0, size=(K, n_ctrl, 7)).astype(np.float32)
+    eps = np.einsum("tn,knd->ktd", basis, ctrl, optimize=True).astype(np.float32, copy=False)
+    sched = _noise_schedule(float(cfg.noise_std_min), float(cfg.noise_std_max), T, str(cfg.noise_schedule))
+    return (eps * sched[None, :, None]).astype(np.float32, copy=False)
+
+
 @dataclass(frozen=True)
 class JointMPPIConfig:
     horizon: int = 8
@@ -308,6 +357,12 @@ class JointMPPIConfig:
     debug_cost_stats_q: float = 0.5
     temperature: float = 1.0
     noise_std: float = 0.05
+    noise_mode: str = "gaussian"
+    noise_nknots: int = 4
+    noise_degree: int = 3
+    noise_std_min: float = 0.05
+    noise_std_max: float = 0.50
+    noise_schedule: str = "linear"
     dt: float = 1.0
 
     w_smooth: float = 1.0
@@ -414,6 +469,9 @@ class JointMPPISolver:
 
         self.last_goal_ee_xyz: Optional[tuple[float, float, float]] = None
         self.last_goal_error_final_m: float = float("nan")
+        self.last_actions_finite: bool = True
+        self.last_joint_limit_penalty_mean: float = 0.0
+        self.last_joint_limit_penalty_q95: float = 0.0
 
         self._fk: FrankaFK | None = None
         self._fk_link7: FrankaFK | None = None
@@ -556,6 +614,7 @@ class JointMPPISolver:
             "pointworld_ms": pw_ms,
             "pointworld_reason": pw_reason,
             "curobo_eval_ranges": curobo_eval_ranges,
+            "joint_limit_penalty_raw": joint_limit_raw,
         }
         return total, extra
 
@@ -592,6 +651,9 @@ class JointMPPISolver:
 
         self.last_goal_ee_xyz = None
         self.last_goal_error_final_m = float("nan")
+        self.last_actions_finite = True
+        self.last_joint_limit_penalty_mean = 0.0
+        self.last_joint_limit_penalty_q95 = 0.0
 
         t_infer0 = __import__("time").perf_counter()
 
@@ -752,7 +814,7 @@ class JointMPPISolver:
         q0_np = self._clip_q(q0_np)
 
         rng = np.random.default_rng(seed)
-        eps = rng.normal(0.0, float(cfg.noise_std), size=(K, T, 7)).astype(np.float32)
+        eps = _sample_noise(cfg, rng, K, T)
 
         u_nom = self._u[None, :, :]
         u_cand = self._clip_u(u_nom + eps)
@@ -775,6 +837,10 @@ class JointMPPISolver:
             self.last_pw_ms = float(extra.get("pointworld_ms", 0.0))
             self.last_pw_reason = str(extra.get("pointworld_reason", ""))
             self.last_pw_enabled = self.last_pw_reason == "ok"
+            jl = np.asarray(extra.get("joint_limit_penalty_raw", np.zeros((0,), dtype=np.float32)), dtype=np.float32).reshape(-1)
+            jl = jl[np.isfinite(jl)]
+            self.last_joint_limit_penalty_mean = float(jl.mean()) if jl.size > 0 else 0.0
+            self.last_joint_limit_penalty_q95 = float(np.quantile(jl, 0.95)) if jl.size > 0 else 0.0
             ranges = extra.get("curobo_eval_ranges", ())
             self.last_curobo_eval_ranges = tuple(dict(x) for x in tuple(ranges)) if ranges else ()
             if bool(cfg.debug_cost_stats):
@@ -851,6 +917,7 @@ class JointMPPISolver:
             self._u[-1] = 0.0
 
         self.last_infer_ms = (__import__("time").perf_counter() - t_infer0) * 1000.0
+        self.last_actions_finite = bool(np.all(np.isfinite(actions)))
 
         parts: list[str] = []
         if used_freeze_scene:

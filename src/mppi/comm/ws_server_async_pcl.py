@@ -227,6 +227,12 @@ def _get_joint_solver(open_loop_horizon: int) -> JointMPPISolver:
         debug_cost_stats_q=float(os.getenv("MPPI_DEBUG_COST_STATS_Q", "0.5")),
         temperature=float(os.getenv("MPPI_TEMPERATURE", "1.0")),
         noise_std=float(os.getenv("MPPI_NOISE_STD", "0.05")),
+        noise_mode=str(os.getenv("MPPI_NOISE_MODE", "gaussian")),
+        noise_nknots=int(os.getenv("MPPI_NOISE_NKNOTS", "4")),
+        noise_degree=int(os.getenv("MPPI_NOISE_DEGREE", "3")),
+        noise_std_min=float(os.getenv("MPPI_NOISE_STD_MIN", os.getenv("MPPI_NOISE_STD", "0.05"))),
+        noise_std_max=float(os.getenv("MPPI_NOISE_STD_MAX", os.getenv("MPPI_NOISE_STD", "0.05"))),
+        noise_schedule=str(os.getenv("MPPI_NOISE_SCHEDULE", "linear")),
         dt=float(os.getenv("MPPI_DT", "1.0")),
         w_smooth=float(os.getenv("MPPI_W_SMOOTH", "1.0")),
         w_action=float(os.getenv("MPPI_W_ACTION", "0.01")),
@@ -584,6 +590,9 @@ def _maybe_dump_pointworld_acceptance(
     summary: Dict[str, Any] = {
         "step_id": int(step_id),
         "has_goal_ee_xyz": goal_ee_xyz is not None,
+        "actions_finite": None,
+        "joint_limit_penalty_mean": None,
+        "joint_limit_penalty_q95": None,
         "goal_ee_xyz": ([float(goal_ee_xyz[0]), float(goal_ee_xyz[1]), float(goal_ee_xyz[2])] if goal_ee_xyz is not None else None),
         "goal_error_final_m": (float(goal_error_final_m) if goal_error_final_m is not None and np.isfinite(goal_error_final_m) else None),
         "has_scene_flows": "scene_flows" in pointworld_obs,
@@ -603,6 +612,12 @@ def _maybe_dump_pointworld_acceptance(
 
     if isinstance(pw_cost_debug, dict) and pw_cost_debug:
         summary["pw_cost_debug"] = dict(pw_cost_debug)
+        if "actions_finite" in pw_cost_debug:
+            summary["actions_finite"] = bool(pw_cost_debug.get("actions_finite", True))
+        if "joint_limit_penalty_mean" in pw_cost_debug:
+            summary["joint_limit_penalty_mean"] = float(pw_cost_debug.get("joint_limit_penalty_mean", 0.0) or 0.0)
+        if "joint_limit_penalty_q95" in pw_cost_debug:
+            summary["joint_limit_penalty_q95"] = float(pw_cost_debug.get("joint_limit_penalty_q95", 0.0) or 0.0)
 
     if isinstance(timing_breakdown, dict) and timing_breakdown:
         summary["timing_breakdown"] = dict(timing_breakdown)
@@ -1419,6 +1434,9 @@ async def _handle_connection(
                     "enabled": bool(getattr(solver, "last_pw_enabled", False)),
                     "reason": str(getattr(solver, "last_pw_reason", "") or ""),
                     "ms": float(getattr(solver, "last_pw_ms", 0.0) or 0.0),
+                    "actions_finite": bool(getattr(solver, "last_actions_finite", True)),
+                    "joint_limit_penalty_mean": float(getattr(solver, "last_joint_limit_penalty_mean", 0.0) or 0.0),
+                    "joint_limit_penalty_q95": float(getattr(solver, "last_joint_limit_penalty_q95", 0.0) or 0.0),
                 }
                 if pw_cost_fn0 is not None:
                     eval_ranges = getattr(pw_cost_fn0, "last_eval_ranges", ())
@@ -1439,6 +1457,9 @@ async def _handle_connection(
                     pw_cost_debug["error_traceback"] = tb
 
                 tb["pw_ms"] = float(pw_cost_debug.get("ms", 0.0) or 0.0)
+                tb["actions_finite"] = bool(pw_cost_debug.get("actions_finite", True))
+                tb["joint_limit_penalty_mean"] = float(pw_cost_debug.get("joint_limit_penalty_mean", 0.0) or 0.0)
+                tb["joint_limit_penalty_q95"] = float(pw_cost_debug.get("joint_limit_penalty_q95", 0.0) or 0.0)
                 _maybe_dump_pointworld_acceptance(
                     pointworld_obs=pw_obs,
                     step_id=int(obs.step_id),
