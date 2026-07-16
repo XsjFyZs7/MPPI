@@ -62,7 +62,10 @@ def _require_torch():
 def _infer_cotracker_window_len(checkpoint: str) -> int | None:
     torch = _require_torch()
     with open(str(checkpoint), "rb") as f:
-        state_dict = torch.load(f, map_location="cpu")
+        try:
+            state_dict = torch.load(f, map_location="cpu", weights_only=False)
+        except TypeError:
+            state_dict = torch.load(f, map_location="cpu")
     if isinstance(state_dict, dict) and "model" in state_dict:
         state_dict = state_dict["model"]
     if not isinstance(state_dict, dict):
@@ -77,6 +80,10 @@ def _infer_cotracker_window_len(checkpoint: str) -> int | None:
     if len(shape) >= 2 and int(shape[1]) > 0:
         return int(shape[1])
     return None
+
+
+def infer_cotracker_window_len(checkpoint: str) -> int | None:
+    return _infer_cotracker_window_len(str(checkpoint))
 
 
 def _as_frames_array(frames: Union[np.ndarray, Sequence[np.ndarray]]) -> np.ndarray:

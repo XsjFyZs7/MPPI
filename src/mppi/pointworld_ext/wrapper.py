@@ -100,7 +100,10 @@ class PointWorldCostModel:
         ckpt = str(checkpoint_path).strip()
         if not ckpt:
             raise ValueError("PointWorld checkpoint_path is required")
-        return self._torch.load(ckpt, map_location="cpu", weights_only=False)
+        try:
+            return self._torch.load(ckpt, map_location="cpu", weights_only=False)
+        except TypeError:
+            return self._torch.load(ckpt, map_location="cpu")
 
     def _expand_device_list(self, raw: str, *, fallback: str) -> list[str]:
         parts = [p.strip() for p in str(raw).split(",") if p.strip()]
@@ -325,10 +328,10 @@ class PointWorldCostModel:
 
         scene = prepare_scene_inputs(
             scene_flows=np.asarray(pointworld_obs["scene_flows"], dtype=np.float32),
-            scene_colors=np.asarray(pointworld_obs.get("scene_colors"), dtype=np.uint8),
+            scene_colors=np.asarray(pointworld_obs.get("scene_colors")),
             scene_exists=np.asarray(pointworld_obs["scene_exists"], dtype=bool),
             scene_track_confidence=pointworld_obs.get("scene_track_confidence"),
-            batch_size=1,
+            batch_size=B,
             max_scene_points=int(self.max_scene_points),
         )
 
@@ -432,10 +435,13 @@ class PointWorldCostModel:
         replica: _PointWorldReplica,
         scene_np: dict[str, np.ndarray],
         batch_np: dict[str, np.ndarray],
-    ) -> tuple[np.ndarray, dict[str, Any]]:
+        valid_pred_steps: Optional[int] = None,
+        return_next_scene_p0: bool = False,
+    ) -> tuple[np.ndarray, dict[str, Any]] | tuple[np.ndarray, np.ndarray, dict[str, Any]]:
         B = int(batch_np["robot_flows"].shape[0])
         chunk_size = max(1, min(int(self.cfg.eval_batch_size), B))
         costs: list[np.ndarray] = []
+        next_p0: list[np.ndarray] = []
         torch = self._torch
 
         timing: dict[str, Any] = {
@@ -468,9 +474,9 @@ class PointWorldCostModel:
             robot_t = self._numpy_batch_to_torch(batch_chunk, device=replica.device)
             chunk_b = int(end - start)
 
-            scene_flows_t = scene_t["scene_flows"].expand(chunk_b, -1, -1, -1)
-            scene_colors_t = scene_t["scene_colors"].expand(chunk_b, -1, -1, -1)
-            scene_exists_t = scene_t["scene_exists"].expand(chunk_b, -1, -1)
+            scene_flows_t = scene_t["scene_flows"][start:end]
+            scene_colors_t = scene_t["scene_colors"][start:end]
+            scene_exists_t = scene_t["scene_exists"][start:end]
             t_feat0 = time.perf_counter()
             out = build_scene_features_torch(
                 scene_flows=scene_flows_t,
@@ -510,10 +516,18 @@ class PointWorldCostModel:
                 outputs = replica.model(batch_t, training=False, encoded_scene_feat0=encoded_scene)
             timing["t_model_ms"] = float(timing["t_model_ms"]) + (time.perf_counter() - t_m0) * 1000.0
 
+            if bool(return_next_scene_p0) and "scene_relative" in outputs:
+                t_last = int(valid_pred_steps) if valid_pred_steps is not None else int(scene_flows_t.shape[1] - 1)
+                t_last = max(0, min(int(t_last), int(outputs["scene_relative"].shape[1]) - 1))
+                p0 = scene_flows_t[:, 0]
+                rel_last = outputs["scene_relative"][:, t_last]
+                p_next = (p0 + rel_last).detach().cpu().numpy().astype(np.float32)
+                next_p0.append(p_next)
+
             model_conf = outputs.get("confidence")
             track_conf_t = None
             if "scene_track_confidence" in scene_t:
-                track_conf_t = scene_t["scene_track_confidence"].expand(chunk_b, -1, -1)
+                track_conf_t = scene_t["scene_track_confidence"][start:end]
 
             mode = str(self.cfg.cost.mode)
             task_mode = mode in {"task_point_goal_l2", "final_task_point_goal_l2"}
@@ -540,6 +554,7 @@ class PointWorldCostModel:
                         scene_p0=scene_flows_t[:, 0],
                         task_point_indices=idx_term,
                         task_goal_positions=goal_term,
+                        valid_pred_steps=valid_pred_steps,
                         cfg=self.cfg.cost,
                     )
                 timing["t_reduce_ms"] = float(timing["t_reduce_ms"]) + (time.perf_counter() - t_r0) * 1000.0
@@ -554,6 +569,7 @@ class PointWorldCostModel:
                         scene_exists=batch_t["scene_exists"],
                         model_confidence=model_conf,
                         track_confidence=track_conf_t,
+                        valid_pred_steps=valid_pred_steps,
                         cfg=self.cfg.cost,
                     ).detach().cpu().numpy().astype(np.float32)
                 )
@@ -562,7 +578,11 @@ class PointWorldCostModel:
             timing["chunks"] = int(timing["chunks"]) + 1
 
         timing["t_total_ms"] = (time.perf_counter() - t_rep0) * 1000.0
-        return np.concatenate(costs, axis=0).astype(np.float32, copy=False), timing
+        out_cost = np.concatenate(costs, axis=0).astype(np.float32, copy=False)
+        if bool(return_next_scene_p0):
+            out_p0 = np.concatenate(next_p0, axis=0).astype(np.float32, copy=False) if next_p0 else np.zeros((int(out_cost.shape[0]), 0, 3), dtype=np.float32)
+            return out_cost, out_p0, timing
+        return out_cost, timing
 
     def _evaluate_cost_on_replica(
         self,
@@ -586,6 +606,38 @@ class PointWorldCostModel:
         timing["t_total_with_prepare_ms"] = float(t_prepare_ms) + float(timing.get("t_total_ms", 0.0) or 0.0)
         return costs, timing
 
+    def _evaluate_chunk_on_replica(
+        self,
+        *,
+        replica: _PointWorldReplica,
+        q_traj: np.ndarray,
+        pointworld_obs: dict[str, Any],
+        gripper: Optional[float],
+        valid_pred_steps: int,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+        t_p0 = time.perf_counter()
+        scene_np, batch_np = self._prepare_batch(
+            q_traj=q_traj,
+            pointworld_obs=pointworld_obs,
+            gripper=gripper,
+            robot=replica.robot,
+        )
+        t_prepare_ms = (time.perf_counter() - t_p0) * 1000.0
+        result = self._evaluate_batch_on_replica(
+            replica=replica,
+            scene_np=scene_np,
+            batch_np=batch_np,
+            valid_pred_steps=int(valid_pred_steps),
+            return_next_scene_p0=True,
+        )
+        if not (isinstance(result, tuple) and len(result) == 3):
+            raise RuntimeError("Expected (costs,next_scene_p0,timing) from _evaluate_batch_on_replica")
+        costs, next_p0, timing = result
+        timing = dict(timing)
+        timing["t_prepare_batch_ms"] = float(t_prepare_ms)
+        timing["t_total_with_prepare_ms"] = float(t_prepare_ms) + float(timing.get("t_total_ms", 0.0) or 0.0)
+        return np.asarray(costs, dtype=np.float32), np.asarray(next_p0, dtype=np.float32), timing
+
     def _make_ranges(self, total: int, parts: int) -> list[tuple[int, int]]:
         if total <= 0 or parts <= 0:
             return []
@@ -600,6 +652,95 @@ class PointWorldCostModel:
             out.append((start, end))
             start = end
         return out
+
+    def evaluate_chunk(
+        self,
+        *,
+        q_traj: np.ndarray,
+        pointworld_obs: dict[str, Any],
+        gripper: Optional[float],
+        valid_pred_steps: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        q = np.asarray(q_traj, dtype=np.float32)
+        if q.ndim != 3 or q.shape[-1] != 7:
+            raise ValueError(f"q_traj must be (B,T,7), got {q.shape}")
+        B = int(q.shape[0])
+        if B == 0:
+            return np.zeros((0,), dtype=np.float32), np.zeros((0, 0, 3), dtype=np.float32)
+
+        if len(self._replicas) == 1:
+            costs, next_p0, timing = self._evaluate_chunk_on_replica(
+                replica=self._replicas[0],
+                q_traj=q,
+                pointworld_obs=pointworld_obs,
+                gripper=gripper,
+                valid_pred_steps=int(valid_pred_steps),
+            )
+            self.last_eval_ranges = (
+                {
+                    "device": str(self._replicas[0].device),
+                    "start": 0,
+                    "end": int(B),
+                    "samples": int(B),
+                },
+            )
+            self.last_timing = {
+                "mode": "single",
+                "devices": [str(self._replicas[0].device)],
+                "replicas": [dict(timing)],
+            }
+            return np.asarray(costs, dtype=np.float32), np.asarray(next_p0, dtype=np.float32)
+
+        ranges = self._make_ranges(B, len(self._replicas))
+        costs_out = np.zeros((B,), dtype=np.float32)
+        next_out = np.zeros((B, 0, 3), dtype=np.float32)
+
+        rep_timings: list[dict[str, Any]] = []
+
+        def _worker(replica: _PointWorldReplica, start: int, end: int) -> tuple[int, int, np.ndarray, np.ndarray, dict[str, Any]]:
+            c, p0, t = self._evaluate_chunk_on_replica(
+                replica=replica,
+                q_traj=q[start:end],
+                pointworld_obs=pointworld_obs,
+                gripper=gripper,
+                valid_pred_steps=int(valid_pred_steps),
+            )
+            return int(start), int(end), np.asarray(c, dtype=np.float32), np.asarray(p0, dtype=np.float32), dict(t)
+
+        with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+            futures = [
+                pool.submit(_worker, self._replicas[idx], start, end)
+                for idx, (start, end) in enumerate(ranges)
+            ]
+            got_shape = None
+            for fut in futures:
+                start, end, c, p0, t = fut.result()
+                costs_out[start:end] = c
+                if got_shape is None:
+                    got_shape = tuple(p0.shape[1:])
+                    next_out = np.zeros((B,) + got_shape, dtype=np.float32)
+                next_out[start:end] = p0
+                t = dict(t)
+                t["start"] = int(start)
+                t["end"] = int(end)
+                t["samples"] = int(end - start)
+                rep_timings.append(t)
+
+        self.last_eval_ranges = tuple(
+            {
+                "device": str(self._replicas[idx].device),
+                "start": int(start),
+                "end": int(end),
+                "samples": int(end - start),
+            }
+            for idx, (start, end) in enumerate(ranges)
+        )
+        self.last_timing = {
+            "mode": "multi",
+            "devices": [str(r.device) for r in self._replicas],
+            "replicas": rep_timings,
+        }
+        return costs_out, next_out
 
     def evaluate_cost(
         self,

@@ -201,32 +201,59 @@ def prepare_scene_inputs(
         else np.ones(exists.shape, dtype=np.float32)
     )
 
-    if flows.ndim != 3 or flows.shape[-1] != 3:
-        raise ValueError(f"scene_flows must be (T,N,3), got {flows.shape}")
-    if exists.shape != flows.shape[:2]:
-        raise ValueError(f"scene_exists shape {exists.shape} must match scene_flows[:2]={flows.shape[:2]}")
-    if conf.shape != flows.shape[:2]:
-        raise ValueError(f"scene_track_confidence shape {conf.shape} must match scene_flows[:2]={flows.shape[:2]}")
+    if flows.ndim == 3:
+        if flows.shape[-1] != 3:
+            raise ValueError(f"scene_flows must be (T,N,3), got {flows.shape}")
+        if exists.shape != flows.shape[:2]:
+            raise ValueError(f"scene_exists shape {exists.shape} must match scene_flows[:2]={flows.shape[:2]}")
+        if conf.shape != flows.shape[:2]:
+            raise ValueError(f"scene_track_confidence shape {conf.shape} must match scene_flows[:2]={flows.shape[:2]}")
+        flows_b0 = flows[None, ...]
+        exists_b0 = exists[None, ...]
+        conf_b0 = conf[None, ...]
+    elif flows.ndim == 4:
+        if flows.shape[-1] != 3:
+            raise ValueError(f"scene_flows must be (B,T,N,3), got {flows.shape}")
+        if exists.shape != flows.shape[:3]:
+            raise ValueError(f"scene_exists shape {exists.shape} must match scene_flows[:3]={flows.shape[:3]}")
+        if conf.shape != flows.shape[:3]:
+            raise ValueError(f"scene_track_confidence shape {conf.shape} must match scene_flows[:3]={flows.shape[:3]}")
+        flows_b0 = flows
+        exists_b0 = exists
+        conf_b0 = conf
+    else:
+        raise ValueError(f"scene_flows must be (T,N,3) or (B,T,N,3), got {flows.shape}")
 
-    T = int(flows.shape[0])
+    B0, T0, _N0 = int(flows_b0.shape[0]), int(flows_b0.shape[1]), int(flows_b0.shape[2])
+    B = int(batch_size)
     Ns = int(max_scene_points)
 
     if colors.dtype == np.uint8:
         colors_f = colors.astype(np.float32) / 255.0
     else:
         colors_f = np.asarray(colors, dtype=np.float32)
-    if colors_f.shape != flows.shape:
-        colors_f = np.zeros_like(flows, dtype=np.float32)
 
-    flows_b = np.repeat(flows[None, ...], batch_size, axis=0)
-    colors_b = np.repeat(colors_f[None, ...], batch_size, axis=0)
-    exists_b = np.repeat(exists[None, ...], batch_size, axis=0)
-    conf_b = np.repeat(conf[None, ...], batch_size, axis=0)
+    if flows.ndim == 3:
+        if colors_f.shape != flows.shape:
+            colors_f = np.zeros_like(flows, dtype=np.float32)
+        colors_b0 = colors_f[None, ...]
+    else:
+        if colors_f.shape != flows.shape:
+            colors_f = np.zeros_like(flows, dtype=np.float32)
+        colors_b0 = colors_f
 
-    flows_b = _pad_or_trim_btn3(flows_b, B=batch_size, T=T, N=Ns, dtype=np.float32)
-    colors_b = _pad_or_trim_btn3(colors_b, B=batch_size, T=T, N=Ns, dtype=np.float32)
-    exists_b = _pad_or_trim_btn(exists_b, B=batch_size, T=T, N=Ns, dtype=bool)
-    conf_b = _pad_or_trim_btn(conf_b, B=batch_size, T=T, N=Ns, dtype=np.float32)
+    if B0 == 1 and B > 1:
+        flows_b0 = np.repeat(flows_b0, B, axis=0)
+        colors_b0 = np.repeat(colors_b0, B, axis=0)
+        exists_b0 = np.repeat(exists_b0, B, axis=0)
+        conf_b0 = np.repeat(conf_b0, B, axis=0)
+    elif B0 != B:
+        raise ValueError(f"scene batch B={B0} must match batch_size={B}")
+
+    flows_b = _pad_or_trim_btn3(flows_b0, B=B, T=T0, N=Ns, dtype=np.float32)
+    colors_b = _pad_or_trim_btn3(colors_b0, B=B, T=T0, N=Ns, dtype=np.float32)
+    exists_b = _pad_or_trim_btn(exists_b0, B=B, T=T0, N=Ns, dtype=bool)
+    conf_b = _pad_or_trim_btn(conf_b0, B=B, T=T0, N=Ns, dtype=np.float32)
 
     return {
         "scene_flows": flows_b,

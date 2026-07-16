@@ -420,7 +420,7 @@ class JointMPPIConfig:
 
     use_pointworld_cost: bool = False
     w_pointworld: float = 0.0
-    pointworld_require_horizon_11: bool = True
+    pointworld_window_size: int = 11
     pointworld_cost_timeout_ms: float = 0.0
 
     urdf_path: str = default_urdf_path()
@@ -465,6 +465,12 @@ class JointMPPISolver:
         self.last_pw_enabled: bool = False
         self.last_pw_reason: str = ""
         self.last_pw_ms: float = 0.0
+        self.last_pw_window_size: int = 0
+        self.last_pw_chunk_stride: int = 0
+        self.last_pw_chunk_count: int = 0
+        self.last_pw_last_chunk_valid_steps: int = 0
+        self.last_pw_chunking_enabled: bool = False
+        self.last_pw_chunk_mode: str = ""
         self.last_curobo_eval_ranges: tuple[dict[str, Any], ...] = ()
 
         self.last_goal_ee_xyz: Optional[tuple[float, float, float]] = None
@@ -574,25 +580,125 @@ class JointMPPISolver:
             else:
                 t_pw0 = __import__("time").perf_counter()
                 try:
-                    pw_cost = pointworld_cost_fn(
-                        q_traj=np.asarray(q_traj[:, 1:, :], dtype=np.float32),
-                        u_traj=np.asarray(u_traj, dtype=np.float32),
-                        pointworld_obs=pointworld_obs,
-                        gripper=float(gripper) if gripper is not None else None,
-                    )
+                    if not hasattr(pointworld_cost_fn, "evaluate_chunk"):
+                        raise RuntimeError("PointWorld cost model must implement evaluate_chunk() for strict chunking")
+
+                    K = int(q_traj.shape[0])
+                    H = int(u_traj.shape[1])
+                    Tw = int(getattr(self.cfg, "pointworld_window_size", 11))
+                    stride = max(1, int(Tw - 1))
+
+                    sf = np.asarray(pointworld_obs.get("scene_flows"), dtype=np.float32)
+                    if sf.ndim != 3 or sf.shape[-1] != 3:
+                        raise ValueError(f"pointworld_obs.scene_flows must be (T,N,3), got {sf.shape}")
+                    p0_scene = np.asarray(sf[0], dtype=np.float32)
+                    N0 = int(p0_scene.shape[0])
+
+                    inner_pw = getattr(pointworld_cost_fn, "_inner", pointworld_cost_fn)
+                    Ns = int(getattr(inner_pw, "max_scene_points", N0))
+
+                    def _pad_n3(x: np.ndarray, *, Ns: int, dtype: np.dtype) -> np.ndarray:
+                        a = np.asarray(x)
+                        if a.ndim != 2 or int(a.shape[1]) != 3:
+                            raise ValueError(f"Expected (N,3), got {a.shape}")
+                        out = np.zeros((int(Ns), 3), dtype=dtype)
+                        n = min(int(Ns), int(a.shape[0]))
+                        if n > 0:
+                            out[:n] = a[:n].astype(dtype, copy=False)
+                        return out
+
+                    def _pad_n(x: np.ndarray, *, Ns: int, dtype: np.dtype, fill: float = 0.0) -> np.ndarray:
+                        a = np.asarray(x)
+                        if a.ndim != 1:
+                            raise ValueError(f"Expected (N,), got {a.shape}")
+                        out = np.full((int(Ns),), fill, dtype=dtype)
+                        n = min(int(Ns), int(a.shape[0]))
+                        if n > 0:
+                            out[:n] = a[:n].astype(dtype, copy=False)
+                        return out
+
+                    raw_sc = pointworld_obs.get("scene_colors", None)
+                    sc = np.asarray(raw_sc) if raw_sc is not None else np.zeros_like(sf, dtype=np.uint8)
+                    if sc.shape != sf.shape:
+                        sc = np.zeros_like(sf, dtype=np.uint8)
+                    if sc.dtype != np.uint8:
+                        if np.issubdtype(sc.dtype, np.floating):
+                            mx = float(np.nanmax(sc)) if sc.size else 0.0
+                            if mx <= 1.0:
+                                sc = np.clip(sc * 255.0, 0.0, 255.0).astype(np.uint8)
+                            else:
+                                sc = np.clip(sc, 0.0, 255.0).astype(np.uint8)
+                        else:
+                            sc = np.clip(sc, 0, 255).astype(np.uint8)
+                    c0_scene = _pad_n3(sc[0], Ns=Ns, dtype=np.uint8)
+
+                    se = np.asarray(pointworld_obs.get("scene_exists"), dtype=bool)
+                    if se.ndim != 2 or se.shape[0] != sf.shape[0] or se.shape[1] != N0:
+                        raise ValueError(f"pointworld_obs.scene_exists must be (T,N) matching scene_flows, got {se.shape}")
+                    e0_scene = _pad_n(se[0], Ns=Ns, dtype=bool, fill=0.0)
+
+                    stc = pointworld_obs.get("scene_track_confidence", None)
+                    if stc is None:
+                        tc0_scene = np.ones((Ns,), dtype=np.float32)
+                    else:
+                        tc = np.asarray(stc, dtype=np.float32)
+                        if tc.ndim != 2 or tc.shape != se.shape:
+                            raise ValueError(f"pointworld_obs.scene_track_confidence must be (T,N) matching scene_exists, got {tc.shape}")
+                        tc0_scene = _pad_n(tc[0], Ns=Ns, dtype=np.float32, fill=0.0)
+
+                    p0_scene_pad = _pad_n3(p0_scene, Ns=Ns, dtype=np.float32)
+                    scene_p0 = np.repeat(p0_scene_pad[None, ...], K, axis=0)
+                    colors0 = np.repeat(c0_scene[None, ...], K, axis=0)
+                    exists0 = np.repeat(e0_scene[None, ...], K, axis=0)
+                    conf0 = np.repeat(tc0_scene[None, ...], K, axis=0)
+
+                    total_cost = np.zeros((K,), dtype=np.float32)
+
+                    chunk_count = int((max(0, H) + stride - 1) // stride) if H > 0 else 0
+                    for ci in range(int(chunk_count)):
+                        step0 = int(ci * stride)
+                        pred_steps = int(min(stride, max(0, H - step0)))
+                        if pred_steps <= 0:
+                            break
+
+                        q_ctx = np.asarray(q_traj[:, step0 : step0 + 1, :], dtype=np.float32)
+                        q_chunk = np.repeat(q_ctx, int(Tw), axis=1)
+                        q_avail = np.asarray(q_traj[:, step0 : step0 + pred_steps + 1, :], dtype=np.float32)
+                        q_chunk[:, : q_avail.shape[1], :] = q_avail
+
+                        obs_chunk = dict(pointworld_obs)
+                        obs_chunk["scene_flows"] = np.repeat(scene_p0[:, None, :, :], int(Tw), axis=1)
+                        obs_chunk["scene_colors"] = np.repeat(colors0[:, None, :, :], int(Tw), axis=1)
+                        obs_chunk["scene_exists"] = np.repeat(exists0[:, None, :], int(Tw), axis=1)
+                        obs_chunk["scene_track_confidence"] = np.repeat(conf0[:, None, :], int(Tw), axis=1)
+
+                        costs_i, next_p0 = pointworld_cost_fn.evaluate_chunk(
+                            q_traj=q_chunk,
+                            pointworld_obs=obs_chunk,
+                            gripper=float(gripper) if gripper is not None else None,
+                            valid_pred_steps=int(pred_steps),
+                        )
+                        arr = np.asarray(costs_i, dtype=np.float32)
+                        nxt = np.asarray(next_p0, dtype=np.float32)
+                        if arr.ndim != 1 or arr.shape[0] != K:
+                            raise ValueError(f"PointWorld chunk cost must be (B,), got {arr.shape}")
+                        if nxt.ndim != 3 or nxt.shape[0] != K or nxt.shape[1] != Ns or nxt.shape[2] != 3:
+                            raise ValueError(f"PointWorld next_scene_p0 must be (B,N,3)={(K, Ns, 3)}, got {nxt.shape}")
+                        if not bool(np.all(np.isfinite(arr))):
+                            raise ValueError("PointWorld chunk cost contains non-finite values")
+                        if not bool(np.all(np.isfinite(nxt))):
+                            raise ValueError("PointWorld next_scene_p0 contains non-finite values")
+
+                        total_cost = (total_cost + arr).astype(np.float32, copy=False)
+                        scene_p0 = nxt
+
                     pw_ms = (__import__("time").perf_counter() - t_pw0) * 1000.0
                     timeout_ms = float(self.cfg.pointworld_cost_timeout_ms)
                     if timeout_ms > 0.0 and pw_ms > timeout_ms:
                         pw_reason = f"timeout:{pw_ms:.1f}>{timeout_ms:.1f}"
                     else:
-                        arr = np.asarray(pw_cost, dtype=np.float32)
-                        if arr.ndim != 1 or arr.shape[0] != q_traj.shape[0]:
-                            pw_reason = "invalid_shape"
-                        elif not bool(np.all(np.isfinite(arr))):
-                            pw_reason = "nonfinite"
-                        else:
-                            t_pw = float(self.cfg.w_pointworld) * arr
-                            pw_reason = "ok"
+                        t_pw = float(self.cfg.w_pointworld) * total_cost
+                        pw_reason = "ok"
                 except Exception:
                     pw_ms = (__import__("time").perf_counter() - t_pw0) * 1000.0
                     pw_reason = "exception"
@@ -647,6 +753,12 @@ class JointMPPISolver:
         self.last_pw_enabled = False
         self.last_pw_reason = ""
         self.last_pw_ms = 0.0
+        self.last_pw_window_size = 0
+        self.last_pw_chunk_stride = 0
+        self.last_pw_chunk_count = 0
+        self.last_pw_last_chunk_valid_steps = 0
+        self.last_pw_chunking_enabled = False
+        self.last_pw_chunk_mode = ""
         self.last_curobo_eval_ranges = ()
 
         self.last_goal_ee_xyz = None
@@ -660,8 +772,24 @@ class JointMPPISolver:
         cfg = self.cfg
         T = int(cfg.horizon)
         K_cfg = int(cfg.num_samples)
-        if bool(cfg.use_pointworld_cost) and bool(cfg.pointworld_require_horizon_11) and T != 11:
-            raise ValueError(f"PointWorld requires horizon=11, got {T}")
+
+        Tw = int(getattr(cfg, "pointworld_window_size", 11))
+        if bool(cfg.use_pointworld_cost) and float(cfg.w_pointworld) > 0.0:
+            if Tw < 2:
+                raise ValueError(f"pointworld_window_size must be >= 2, got {Tw}")
+            self.last_pw_window_size = int(Tw)
+            self.last_pw_chunk_stride = int(Tw - 1)
+            self.last_pw_chunk_count = int((max(0, int(T)) + max(1, int(Tw - 1)) - 1) // max(1, int(Tw - 1))) if int(T) > 0 else 0
+            self.last_pw_last_chunk_valid_steps = int(max(0, int(T) - max(0, self.last_pw_chunk_count - 1) * int(Tw - 1))) if int(T) > 0 else 0
+            self.last_pw_chunking_enabled = bool(int(T) > int(Tw - 1))
+            self.last_pw_chunk_mode = "strict_rollover"
+        else:
+            self.last_pw_window_size = int(Tw)
+            self.last_pw_chunk_stride = int(max(0, int(Tw - 1)))
+            self.last_pw_chunk_count = 0
+            self.last_pw_last_chunk_valid_steps = 0
+            self.last_pw_chunking_enabled = False
+            self.last_pw_chunk_mode = "disabled"
 
         budget_ms = float(cfg.infer_budget_ms)
         budget_enabled = budget_ms > 0.0
