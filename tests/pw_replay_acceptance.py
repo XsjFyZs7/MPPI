@@ -318,6 +318,23 @@ def _stats(vals: List[float]) -> Dict[str, float]:
     }
 
 
+def _normalize_plan_meta(payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw = payload.get("plan_meta", None)
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key in ("action_space", "fallback_reason"):
+        if key in raw:
+            out[key] = str(raw.get(key, ""))
+    for key in ("source_step_id", "plan_generated_at_ns"):
+        if key in raw and raw.get(key) is not None:
+            out[key] = int(raw[key])
+    for key in ("fallback", "actions_finite"):
+        if key in raw:
+            out[key] = bool(raw.get(key))
+    return out
+
+
 async def run(args: argparse.Namespace) -> None:
     websockets = _require_websockets()
 
@@ -334,6 +351,9 @@ async def run(args: argparse.Namespace) -> None:
     infer_ms_list: List[float] = []
     policy_list: List[str] = []
     row_list: List[Dict[str, Any]] = []
+    fallback_count = 0
+    plan_meta_present_count = 0
+    source_step_mismatch_count = 0
 
     async with websockets.connect(str(args.url), max_size=None) as ws:
         for idx in range(start_idx, end_idx):
@@ -404,12 +424,22 @@ async def run(args: argparse.Namespace) -> None:
             timing = payload.get("server_timing", {}) if isinstance(payload, dict) else {}
             infer_ms = float(timing.get("infer_ms", float("nan"))) if isinstance(timing, dict) else float("nan")
             policy = str(timing.get("policy", "")) if isinstance(timing, dict) else ""
+            plan_meta = _normalize_plan_meta(payload)
+            plan_meta_present = bool(plan_meta)
+            fallback = bool(plan_meta.get("fallback", False))
+            source_step_id = int(plan_meta.get("source_step_id", -1)) if plan_meta.get("source_step_id") is not None else -1
+            if plan_meta_present:
+                plan_meta_present_count += 1
+            if fallback:
+                fallback_count += 1
+            if source_step_id >= 0 and source_step_id != int(step_id):
+                source_step_mismatch_count += 1
 
             infer_ms_list.append(infer_ms)
             policy_list.append(policy)
-            row = {"idx": int(idx), "step_id": int(step_id), "infer_ms": infer_ms, "policy": policy}
+            row = {"idx": int(idx), "step_id": int(step_id), "infer_ms": infer_ms, "policy": policy, "plan_meta": plan_meta}
             row_list.append(row)
-            print(f"[{idx}] step_id={step_id} infer_ms={infer_ms:.3f} policy={policy}")
+            print(f"[{idx}] step_id={step_id} infer_ms={infer_ms:.3f} policy={policy} meta={int(plan_meta_present)} fallback={int(fallback)} source_step_id={source_step_id}")
 
             if bool(args.print_actions):
                 actions = payload.get("actions", None)
@@ -430,6 +460,9 @@ async def run(args: argparse.Namespace) -> None:
         "primary_cam_id": str(args.primary_cam_id),
         "infer_ms": _stats(infer_ms_list),
         "unique_policy_count": int(len(set(policy_list))),
+        "plan_meta_present_count": int(plan_meta_present_count),
+        "fallback_count": int(fallback_count),
+        "source_step_mismatch_count": int(source_step_mismatch_count),
         "rows": row_list,
     }
 

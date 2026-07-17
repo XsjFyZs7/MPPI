@@ -30,6 +30,28 @@ class ClientConfig:
     request_timeout_s: float = 2.0
 
 
+def _normalize_plan_meta(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    raw = payload.get("plan_meta", None)
+    if not isinstance(raw, dict):
+        return None
+    meta: Dict[str, Any] = {}
+    if "action_space" in raw:
+        meta["action_space"] = str(raw.get("action_space", ""))
+    for key in ("source_step_id", "plan_generated_at_ns"):
+        if key in raw and raw.get(key) is not None:
+            meta[key] = int(raw[key])
+    for key in ("fallback", "actions_finite"):
+        if key in raw:
+            meta[key] = bool(raw.get(key))
+    for key in ("fallback_reason",):
+        if key in raw:
+            meta[key] = str(raw.get(key, ""))
+    for key in ("joint_limit_penalty_mean", "joint_limit_penalty_q95"):
+        if key in raw and raw.get(key) is not None:
+            meta[key] = float(raw[key])
+    return meta
+
+
 def _encode_rgb_jpeg(rgb: np.ndarray, *, quality: int = 90) -> bytes:
     arr = np.asarray(rgb)
     if arr.ndim != 3 or arr.shape[2] != 3:
@@ -139,7 +161,11 @@ async def infer_once(
     payload_dict = resp.get("payload", {})
     if not isinstance(payload_dict, dict):
         raise RuntimeError("Bad payload type")
-    return dict(payload_dict)
+    out = dict(payload_dict)
+    plan_meta = _normalize_plan_meta(out)
+    if plan_meta is not None:
+        out["plan_meta"] = plan_meta
+    return out
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -204,7 +230,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     timing = payload.get("server_timing", {})
     policy = str(timing.get("policy", "")) if isinstance(timing, dict) else ""
     infer_ms = float(timing.get("infer_ms", float("nan"))) if isinstance(timing, dict) else float("nan")
-    print(f"infer_ms={infer_ms:.3f} policy={policy}")
+    plan_meta = payload.get("plan_meta", {}) if isinstance(payload.get("plan_meta", {}), dict) else {}
+    fallback = bool(plan_meta.get("fallback", False)) if isinstance(plan_meta, dict) else False
+    source_step_id = int(plan_meta.get("source_step_id", -1)) if isinstance(plan_meta, dict) and plan_meta.get("source_step_id") is not None else -1
+    print(f"infer_ms={infer_ms:.3f} policy={policy} source_step_id={source_step_id} fallback={int(fallback)}")
 
     if bool(args.print_actions):
         actions = payload.get("actions", None)

@@ -1610,6 +1610,8 @@ async def _handle_connection(
 
                 use_curobo = bool(getattr(solver, "cfg", None) and getattr(solver.cfg, "use_curobo_collision", False))
                 ess_ratio = float(getattr(solver, "last_effective_samples_ratio", 0.0) or 0.0)
+                tb["effective_samples_ratio"] = ess_ratio
+                tb["fallback_reason"] = str(getattr(solver, "last_fallback_reason", "") or "")
                 n_cub = int(getattr(solver, "last_scene_num_cuboids", 0) or 0)
                 n_sph = int(getattr(solver, "last_scene_num_robot_spheres", 0) or 0)
                 has_table = bool(getattr(solver, "last_scene_has_table", False))
@@ -1641,6 +1643,8 @@ async def _handle_connection(
 
             actions_arr = np.asarray(actions)
             tb["actions_shape"] = [int(x) for x in actions_arr.shape]
+            tb["plan_meta_present"] = bool(plan_meta)
+            tb["plan_meta_action_space"] = str(plan_meta.get("action_space", ""))
             plan_meta["plan_generated_at_ns"] = int(t_server_send_ns)
 
             timing = ServerTimingPCL(infer_ms=(t1 - t0) * 1000.0, queue_ms=0.0, policy=timing_policy)
