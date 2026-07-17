@@ -1395,6 +1395,16 @@ async def _handle_connection(
             t_solve0 = time.perf_counter()
             if cfg.policy == "dummy_hold":
                 actions = _make_actions_dummy_hold(obs.q, float(obs.gripper), cfg.open_loop_horizon)
+                plan_meta = {
+                    "action_space": "joint_absolute",
+                    "source_step_id": int(obs.step_id),
+                    "plan_generated_at_ns": 0,
+                    "fallback": False,
+                    "fallback_reason": "",
+                    "actions_finite": bool(np.all(np.isfinite(np.asarray(actions)))),
+                    "joint_limit_penalty_mean": 0.0,
+                    "joint_limit_penalty_q95": 0.0,
+                }
             elif cfg.policy == "mppi_joint":
                 solver = _get_joint_solver(cfg.open_loop_horizon)
                 pw_obs = pw.last_pointworld_obs if (pw is not None and bool(pw.enabled)) else None
@@ -1622,11 +1632,16 @@ async def _handle_connection(
                     reason = str(getattr(solver, "last_fallback_reason", ""))
                     actions = _make_actions_dummy_hold(obs.q, float(obs.gripper), cfg.open_loop_horizon)
                     timing_policy = f"{timing_policy}:fallback_hold:{reason}"
+                plan_meta = solver.export_plan_meta(source_step_id=int(obs.step_id), plan_generated_at_ns=0)
             else:
                 raise ValueError(f"Unknown policy: {cfg.policy}")
 
             t1 = time.perf_counter()
             t_server_send_ns = time.time_ns()
+
+            actions_arr = np.asarray(actions)
+            tb["actions_shape"] = [int(x) for x in actions_arr.shape]
+            plan_meta["plan_generated_at_ns"] = int(t_server_send_ns)
 
             timing = ServerTimingPCL(infer_ms=(t1 - t0) * 1000.0, queue_ms=0.0, policy=timing_policy)
             chunk = ActionChunkPCL(
@@ -1636,6 +1651,7 @@ async def _handle_connection(
                 open_loop_horizon=cfg.open_loop_horizon,
                 actions=actions,
                 server_timing=timing,
+                plan_meta=plan_meta,
             )
             resp = InferResponsePCL(request_id=request_id, action_chunk=chunk).to_envelope()
             t_enc0 = time.perf_counter()
@@ -1655,11 +1671,17 @@ async def _handle_connection(
         except Exception as e:  # noqa: BLE001
             try:
                 request_id = str(envelope.get("request_id", "")) if "envelope" in locals() else ""
+                err_source_step_id = None
+                try:
+                    err_source_step_id = int(getattr(obs, "step_id"))
+                except Exception:
+                    pass
                 err = ErrorPCL(
                     request_id=request_id,
                     code="bad_request",
                     message=str(e),
                     t_server_send_ns=time.time_ns(),
+                    source_step_id=err_source_step_id,
                 ).to_envelope()
                 await ws.send(encode_message(err))
             except Exception:

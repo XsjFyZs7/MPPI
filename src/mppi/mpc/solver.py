@@ -493,6 +493,27 @@ class JointMPPISolver:
     def reset(self) -> None:
         self._u[...] = 0.0
 
+    def _ensure_serializable_actions(self, actions: np.ndarray, *, horizon: int) -> np.ndarray:
+        arr = np.asarray(actions, dtype=np.float32)
+        if arr.shape != (int(horizon), 8):
+            raise RuntimeError(f"JointMPPI actions shape mismatch: expected {(int(horizon), 8)}, got {arr.shape}")
+        self.last_actions_finite = bool(np.all(np.isfinite(arr)))
+        if not self.last_actions_finite:
+            raise RuntimeError("JointMPPI produced non-finite actions")
+        return arr
+
+    def export_plan_meta(self, *, source_step_id: int, plan_generated_at_ns: int) -> dict[str, Any]:
+        return {
+            "action_space": "joint_absolute",
+            "source_step_id": int(source_step_id),
+            "plan_generated_at_ns": int(plan_generated_at_ns),
+            "fallback": bool(self.last_fallback),
+            "fallback_reason": str(self.last_fallback_reason or ""),
+            "actions_finite": bool(self.last_actions_finite),
+            "joint_limit_penalty_mean": float(self.last_joint_limit_penalty_mean),
+            "joint_limit_penalty_q95": float(self.last_joint_limit_penalty_q95),
+        }
+
     def _clip_q(self, q: np.ndarray) -> np.ndarray:
         return np.clip(q, self._q_min, self._q_max)
 
@@ -1023,6 +1044,7 @@ class JointMPPISolver:
         if self.last_fallback:
             actions[:, 0:7] = q0_np[None, :]
             actions[:, 7] = float(gripper)
+            actions = self._ensure_serializable_actions(actions, horizon=T)
             self.last_infer_ms = (__import__("time").perf_counter() - t_infer0) * 1000.0
 
             goal = ee_pos_goal if ee_pos_goal is not None else self.cfg.ee_pos_goal
@@ -1044,8 +1066,8 @@ class JointMPPISolver:
             self._u[:-1] = self._u[1:]
             self._u[-1] = 0.0
 
+        actions = self._ensure_serializable_actions(actions, horizon=T)
         self.last_infer_ms = (__import__("time").perf_counter() - t_infer0) * 1000.0
-        self.last_actions_finite = bool(np.all(np.isfinite(actions)))
 
         parts: list[str] = []
         if used_freeze_scene:

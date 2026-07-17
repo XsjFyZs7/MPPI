@@ -153,6 +153,17 @@ class ServerTimingPCL:
         }
 
 
+class PlanMetaPCL(TypedDict, total=False):
+    action_space: str
+    source_step_id: int
+    plan_generated_at_ns: int
+    fallback: bool
+    fallback_reason: str
+    actions_finite: bool
+    joint_limit_penalty_mean: float
+    joint_limit_penalty_q95: float
+
+
 @dataclass(frozen=True)
 class ActionChunkPCL:
     t_server_recv_ns: int
@@ -161,9 +172,10 @@ class ActionChunkPCL:
     open_loop_horizon: int
     actions: Any
     server_timing: ServerTimingPCL
+    plan_meta: Optional[PlanMetaPCL] = None
 
     def to_payload(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "t_server_recv_ns": int(self.t_server_recv_ns),
             "t_server_send_ns": int(self.t_server_send_ns),
             "t_client_send_ns_echo": int(self.t_client_send_ns_echo),
@@ -171,6 +183,9 @@ class ActionChunkPCL:
             "actions": self.actions,
             "server_timing": self.server_timing.to_dict(),
         }
+        if self.plan_meta is not None:
+            payload["plan_meta"] = dict(self.plan_meta)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -193,16 +208,20 @@ class ErrorPCL:
     code: str
     message: str
     t_server_send_ns: int
+    source_step_id: Optional[int] = None
 
     def to_envelope(self) -> EnvelopePCL:
+        payload = {
+            "request_id": self.request_id,
+            "code": str(self.code),
+            "message": str(self.message),
+            "t_server_send_ns": int(self.t_server_send_ns),
+        }
+        if self.source_step_id is not None:
+            payload["source_step_id"] = int(self.source_step_id)
         return {
             "schema_version": SCHEMA_VERSION_PCL,
             "type": "error_pcl",
             "request_id": self.request_id,
-            "payload": {
-                "request_id": self.request_id,
-                "code": str(self.code),
-                "message": str(self.message),
-                "t_server_send_ns": int(self.t_server_send_ns),
-            },
+            "payload": payload,
         }
