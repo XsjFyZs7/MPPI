@@ -274,13 +274,23 @@ print("joint_limit_penalty_q95_max:", max(penalty_q95_vals) if penalty_q95_vals 
 for name, ok in checks:
     print(f"{name}: {'PASS' if ok else 'FAIL'}")
 
+checks.append(("client_report", report_json.is_file()))
+
 if report_json.is_file():
     rep = json.loads(report_json.read_text(encoding="utf-8"))
     infer = rep.get("infer_ms", {})
-    print("client_steps:", rep.get("steps"))
+    steps = int(rep.get("steps", 0) or 0)
+    plan_meta_present_count = int(rep.get("plan_meta_present_count", 0) or 0)
+    source_step_mismatch_count = int(rep.get("source_step_mismatch_count", 0) or 0)
+    checks.append(("plan_meta_present", plan_meta_present_count == steps))
+    checks.append(("source_step_match", source_step_mismatch_count == 0))
+
+    print("client_steps:", steps)
     print("client_infer_ms_mean:", infer.get("mean"))
     print("client_infer_ms_p95:", infer.get("p95"))
     print("client_unique_policy_count:", rep.get("unique_policy_count"))
+    print("client_plan_meta_present_count:", plan_meta_present_count)
+    print("client_source_step_mismatch_count:", source_step_mismatch_count)
 else:
     print("client_report: MISSING")
 

@@ -67,8 +67,18 @@ Depth 必须是 **float32(m)**（与录制数据单位对齐）。
 | t_server_send_ns | int | 是 | server 发送响应时间戳（ns） |
 | t_client_send_ns_echo | int | 是 | 回显 client 的 t_client_send_ns |
 | open_loop_horizon | int | 是 | 返回 action chunk 的长度 |
-| actions | any | 是 | 动作数组（实现上通常是 `float32(H,8)`） |
-| server_timing | dict | 是 | `{infer_ms, queue_ms, policy}` |
+| actions | any | 是 | 动作数组（实现上通常是 `float32(H,8)`）；约定 `actions[:, :7]` 为 absolute joint q（low-rate chunk waypoint），`actions[:, 7]` 为 gripper |
+| server_timing | dict | 是 | `{infer_ms, queue_ms, policy}`（主要用于性能与调试） |
+| plan_meta | dict | 否 | 结构化计划元信息（用于 runner/replay 做 stale/meta 校验），典型字段：`action_space`(joint_absolute)、`source_step_id`、`plan_generated_at_ns`、`fallback`、`fallback_reason`、`actions_finite`、`joint_limit_penalty_*` |
+
+### A5. error_pcl.payload
+| 字段 | 类型 | 必填 | 说明 |
+|---|---:|---:|---|
+| request_id | str | 是 | 回显 request_id |
+| code | str | 是 | 错误码 |
+| message | str | 是 | 错误信息 |
+| t_server_send_ns | int | 是 | server 发送错误时间戳（ns） |
+| source_step_id | int | 否 | 若可获得则回填，用于持久连接下定位是哪一帧输入触发错误 |
 
 ---
 

@@ -4,11 +4,12 @@
 
 当前主链路收敛到 PCL 协议（schema_version=100，ws://<HOST>:9011）：
 - client 上行：双视角 back+side 的 RGB/Depth（可压缩）+ 当前关节 `q(7)` + `step_id/t_client_send_ns` + 末端目标 `goal_ee_xyz(3)`
-- server 侧：在线解码与反投影得到 base 点云；可选接入 PointWorld window/tracking 产出 `scene_flows` 等观测；用 MPPI 求解并回包 `actions(T,8)`
+- server 侧：在线解码与反投影得到 base 点云；可选接入 PointWorld window/tracking 产出 `scene_flows` 等观测；用 MPPI 求解并回包 `actions(T,8)`（`actions[:, :7]` 为 absolute joint q）
+- 响应 payload 可选携带 `plan_meta`，用于 Franka runner / replay 做 `stale/meta/fallback` 校验；`server_timing` 主要保留给性能与调试
 
 本 README 只讲两条主线，并给出可直接复制的启动命令：
 - 线 A：server 本机“数据回放/验收模式”（离线 episode_dir → 回放 client → `FINAL: PASS/FAIL`）
-- 线 B：Franka↔server “通信闭环模式”（先 shadow：只采集+回包校验，不执行；再 execute：安全门控后执行 `actions[0]`）
+- 线 B：Franka↔server “通信闭环模式”（先 shadow：只采集+回包校验，不执行；再 execute：由 Franka runner 在本地完成 `joint clip -> interpolation -> FK safety -> 20Hz control loop`）
 
 ---
 
@@ -143,7 +144,7 @@ MPPI_USE_CUROBO_COLLISION=1 MPPI_CUROBO_DEVICE=cuda:0,cuda:1 MPPI_SCENE_FROM_PCD
 |---|---|---|
 | `src/` | 核心 Python 包 `mppi`（通信/推理/PointWorld/curobo） | `python3 -m mppi.comm.ws_server_async_pcl`、`python3 -m mppi.comm.ws_client_sync_pcl` |
 | `tests/` | 标准回放验收与测试记录（收口 PASS/FAIL） | `tests/run_pw_replay_acceptance.sh`、`tests/pw_replay_acceptance.py` |
-| `scripts/` | 辅助脚本（启动/复现/调试） | `scripts/test_cuRobo_pcl.sh` |
+| `scripts/` | 辅助脚本（启动/复现/调试） | `scripts/run_server.sh`、`scripts/test_cuRobo_pcl.sh` |
 | `configs/` | 相机内参/外参、PointWorld AABB 等配置 | `configs/*_cam_info.yaml`、`configs/T_base_cam_*.yaml`、`configs/pointworld_static_aabbs.json` |
 | `data/` | 示例数据与验收落盘输出 | `data/pw_acceptance/<profile>/...` |
 | `third_party/` | 外部依赖（例如 co-tracker） | 按需安装/引用 |
@@ -203,8 +204,10 @@ MPPI_USE_CUROBO_COLLISION=1 MPPI_CUROBO_DEVICE=cuda:0,cuda:1 MPPI_SCENE_FROM_PCD
 - 标准验收入口：`tests/run_pw_replay_acceptance.sh`
   - 一键：起 server + 回放 + 验收（`no_pw/obs_only/obs_infl` 三档）
 - 回放 client：`tests/pw_replay_acceptance.py`
-  - 发送 PCL 请求（支持 data.json 或原生 episode_dir；支持 back 或 back+side）
-- PCL server 启动脚本：`scripts/test_cuRobo_pcl.sh`
+  - 发送 PCL 请求并校验 `plan_meta/fallback/source_step_id` 等协议语义（支持 data.json 或原生 episode_dir；支持 back 或 back+side）
+- PCL server 启动脚本：`scripts/run_server.sh`
+  - 作为纯规划服务端入口，收口 `host/port/policy/open-loop-horizon/cam-id`
+- 进阶验收/性能脚本：`scripts/test_cuRobo_pcl.sh`
   - 负责把 PCL + cuRobo + PointWorld 的运行期环境变量固化起来
 - 离线 AABB 检测：`scripts/debug_robot_mask.sh`、`scripts/visual_cub.py`
   - 输出点云/聚类结果，并固化到 `configs/pointworld_static_aabbs.json`
@@ -227,8 +230,11 @@ MPPI_USE_CUROBO_COLLISION=1 MPPI_CUROBO_DEVICE=cuda:0,cuda:1 MPPI_SCENE_FROM_PCD
   - payload = `ObsPCL`：支持 `rgb_bytes(jpeg)` + `depth_bytes(npy_zlib)`，以及 `cam_id`/`intrinsics`/`T_base_cam`
 - 响应 envelope：
   - `type = "infer_response_pcl"`
+  - payload 主要包含 `actions(T,8)`、`server_timing`，以及可选 `plan_meta`
+  - `plan_meta` 典型字段：`action_space=joint_absolute`、`source_step_id`、`plan_generated_at_ns`、`fallback`、`fallback_reason`
 - 错误：
   - `type = "error_pcl"`
+  - payload 可选 `source_step_id`，便于持久连接下定位是哪一帧输入触发错误
 
 代码位置：
 - `src/mppi/protocol/types_pcl.py`

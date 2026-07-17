@@ -1,5 +1,10 @@
 cd /home/wangyuhan/MPPI
 
+HOST=${HOST:-0.0.0.0} \
+PORT=${PORT:-9011} \
+MPPI_OPEN_LOOP_HORIZON=${MPPI_OPEN_LOOP_HORIZON:-11} \
+MPPI_POLICY=${MPPI_POLICY:-mppi_joint} \
+CAM_ID=${CAM_ID:-back} \
 MPPI_PCL_CAM_INFO_BACK_PATH=/home/wangyuhan/MPPI/configs/back_cam_info.yaml \
 MPPI_PCL_T_BASE_CAM_BACK_PATH=/home/wangyuhan/MPPI/configs/T_base_cam_back.yaml \
 MPPI_PCL_CAM_INFO_SIDE_PATH=/home/wangyuhan/MPPI/configs/side_cam_info.yaml \
@@ -15,7 +20,6 @@ MPPI_PW_TASK_ABLATION=obs_infl \
 MPPI_PW_TASK_W_OBS=1.0 \
 MPPI_PW_TASK_W_INFL=0.5 \
 MPPI_PW_AABB_CONFIG_PATH=/home/wangyuhan/MPPI/configs/pointworld_static_aabbs.json \
-MPPI_PW_ACCEPTANCE_DUMP_DIR=/home/wangyuhan/MPPI/data/pw_acceptance/obs_infl/server \
 MPPI_USE_CUROBO_COLLISION=0 \
 MPPI_W_EE_POS=1.0 \
 MPPI_W_SMOOTH=0.0 \
@@ -40,8 +44,8 @@ MPPI_URDF_PATH=/home/wangyuhan/PointWorld/assets/franka_description/franka_panda
 MPPI_PW_URDF_PATH=/home/wangyuhan/PointWorld/assets/franka_description/franka_panda_robotiq_2f85.urdf \
 PYTHONPATH=/home/wangyuhan/MPPI/src:/home/wangyuhan/MPPI/third_party/co-tracker:/home/wangyuhan/MPPI/third_party/curobo:/home/wangyuhan/PointWorld:/home/wangyuhan/PointWorld/third_party/dinov3 \
 python3 -u -m mppi.comm.ws_server_async_pcl \
-  --host 0.0.0.0 \
-  --port 9011 \
-  --open-loop-horizon 11 \
-  --policy mppi_joint \
-  --cam-id back
+  --host "${HOST}" \
+  --port "${PORT}" \
+  --open-loop-horizon "${MPPI_OPEN_LOOP_HORIZON}" \
+  --policy "${MPPI_POLICY}" \
+  --cam-id "${CAM_ID}"

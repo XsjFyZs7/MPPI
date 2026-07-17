@@ -173,7 +173,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         horizon = (
             args.open_loop_horizon
             if args.open_loop_horizon is not None
-            else int(_get(cfg, "control.open_loop_horizon", 11))
+            else int(_get(cfg, "server.open_loop_horizon", _get(cfg, "control.open_loop_horizon", 11)))
         )
         policy = args.policy if args.policy is not None else str(_get(cfg, "policy.name", "mppi_joint"))
         cam_id = args.cam_id if args.cam_id is not None else str(_get(cfg, "camera.cam_id", "back"))
