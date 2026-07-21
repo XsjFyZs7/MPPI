@@ -44,7 +44,7 @@ from mppi.pointworld_ext.input_config import (
 from mppi.pointworld_ext.query_manager import QueryPointManager, QueryPointManagerConfig
 from mppi.pointworld_ext.scene_flow_builder import OnlineSceneFlowBuilder
 from mppi.pointworld_ext.pointworld_batch_adapter import build_pointworld_batch
-from mppi.pointworld_ext.tracker_interface import build_cotracker_online_point_tracker
+from mppi.pointworld_ext.tracker_interface import POINTWORLD_WINDOW_LEN, build_cotracker_online_point_tracker, infer_cotracker_window_len
 from mppi.pointworld_ext.wrapper import PointWorldCostModel, PointWorldModelConfig
 from mppi.utils.paths import default_urdf_path, repo_path
 from mppi.pointworld_ext.window_buffer import CameraFrame as PWCameraFrame
@@ -208,13 +208,15 @@ def _tracker_device_summary(tracker: object) -> str:
     return str(device) if str(device) else "unknown"
 
 
-_JOINT_SOLVERS: dict[int, JointMPPISolver] = {}
+_JOINT_SOLVERS: dict[tuple[int, int], JointMPPISolver] = {}
 
 
 def _get_joint_solver(open_loop_horizon: int) -> JointMPPISolver:
     h = int(open_loop_horizon)
-    if h in _JOINT_SOLVERS:
-        return _JOINT_SOLVERS[h]
+    Tw = int(os.getenv("MPPI_PW_WINDOW_SIZE", "11"))
+    key = (int(h), int(Tw))
+    if key in _JOINT_SOLVERS:
+        return _JOINT_SOLVERS[key]
 
     urdf_path = os.getenv("MPPI_URDF_PATH", "").strip() or default_urdf_path()
 
@@ -276,12 +278,13 @@ def _get_joint_solver(open_loop_horizon: int) -> JointMPPISolver:
         w_ee_pos=float(os.getenv("MPPI_W_EE_POS", "0.0")),
         use_pointworld_cost=_effective_use_pointworld_cost(),
         w_pointworld=float(os.getenv("MPPI_W_POINTWORLD", "0.0")),
+        pointworld_window_size=int(os.getenv("MPPI_PW_WINDOW_SIZE", "11")),
         pointworld_cost_timeout_ms=float(os.getenv("MPPI_PW_COST_TIMEOUT_MS", "0.0")),
         urdf_path=str(urdf_path),
     )
 
     solver = JointMPPISolver(cfg)
-    _JOINT_SOLVERS[h] = solver
+    _JOINT_SOLVERS[key] = solver
     return solver
 
 
@@ -1087,8 +1090,16 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
         ee_filter_margin_m=float(os.getenv("MPPI_PW_EE_FILTER_MARGIN_M", "0.0")),
     )
 
+    Tw = _env_i("MPPI_PW_WINDOW_SIZE", str(POINTWORLD_WINDOW_LEN))
+    if int(Tw) != int(POINTWORLD_WINDOW_LEN):
+        raise ValueError(f"PointWorld requires window_size={int(POINTWORLD_WINDOW_LEN)}, got MPPI_PW_WINDOW_SIZE={int(Tw)}")
+
+    inferred = infer_cotracker_window_len(str(ckpt))
+    if inferred is not None and int(inferred) < int(Tw):
+        raise ValueError(f"CoTracker checkpoint window_len={int(inferred)} must be >= Tw={int(Tw)}")
+
     cfg = PointWorldInputConfig(
-        window_size=11,
+        window_size=int(Tw),
         tracking=tracking,
         workspace_filter=workspace,
         robot_filter=robot,
@@ -1100,11 +1111,11 @@ def _build_pointworld_runtime() -> Optional[_PointWorldRuntime]:
         min_cameras=len(REQUIRED_CAM_IDS),
     )
 
-    window = PointWorldWindowBuffer(window_size=11)
+    window = PointWorldWindowBuffer(window_size=int(Tw))
     query_manager = QueryPointManager(cfg=QueryPointManagerConfig(max_query_points_per_camera=int(max_q), min_track_confidence=float(min_conf), rng_seed=int(rng_seed)))
     tracker = build_cotracker_online_point_tracker(
         checkpoint=str(ckpt),
-        window_len=11,
+        window_len=int(Tw),
         device=device,
         iters=int(os.getenv("MPPI_PW_COTRACKER_ITERS", "6")),
     )
@@ -1396,23 +1407,53 @@ async def _handle_connection(
 
                 if pw_cost_fn0 is not None:
 
-                    def _wrapped_pw_cost_fn(*, q_traj: np.ndarray, u_traj: np.ndarray, pointworld_obs: dict[str, Any], gripper: Optional[float] = None):
-                        try:
-                            return pw_cost_fn0(
-                                q_traj=q_traj,
-                                u_traj=u_traj,
-                                pointworld_obs=pointworld_obs,
-                                gripper=gripper,
-                            )
-                        except Exception as e:  # noqa: BLE001
-                            import traceback
+                    class _WrappedPWCost:
+                        def __init__(self, inner: Any, err: Dict[str, Any]):
+                            self._inner = inner
+                            self._err = err
 
-                            pw_cost_error["type"] = type(e).__name__
-                            pw_cost_error["message"] = str(e)
-                            pw_cost_error["traceback"] = traceback.format_exc()
-                            raise
+                        def __call__(
+                            self,
+                            *,
+                            q_traj: np.ndarray,
+                            u_traj: np.ndarray,
+                            pointworld_obs: dict[str, Any],
+                            gripper: Optional[float] = None,
+                        ):
+                            try:
+                                return self._inner(q_traj=q_traj, u_traj=u_traj, pointworld_obs=pointworld_obs, gripper=gripper)
+                            except Exception as e:  # noqa: BLE001
+                                import traceback
 
-                    pw_cost_fn: Optional[PointWorldCostFn] = _wrapped_pw_cost_fn
+                                self._err["type"] = type(e).__name__
+                                self._err["message"] = str(e)
+                                self._err["traceback"] = traceback.format_exc()
+                                raise
+
+                        def evaluate_chunk(
+                            self,
+                            *,
+                            q_traj: np.ndarray,
+                            pointworld_obs: dict[str, Any],
+                            gripper: Optional[float],
+                            valid_pred_steps: int,
+                        ):
+                            try:
+                                return self._inner.evaluate_chunk(
+                                    q_traj=q_traj,
+                                    pointworld_obs=pointworld_obs,
+                                    gripper=gripper,
+                                    valid_pred_steps=int(valid_pred_steps),
+                                )
+                            except Exception as e:  # noqa: BLE001
+                                import traceback
+
+                                self._err["type"] = type(e).__name__
+                                self._err["message"] = str(e)
+                                self._err["traceback"] = traceback.format_exc()
+                                raise
+
+                    pw_cost_fn = _WrappedPWCost(pw_cost_fn0, pw_cost_error)
                 else:
                     pw_cost_fn = None
 
@@ -1426,6 +1467,12 @@ async def _handle_connection(
                 )
 
                 tb["t_solver_ms"] = (time.perf_counter() - t_solve0) * 1000.0
+                tb["planning_horizon"] = int(cfg.open_loop_horizon)
+                tb["pointworld_window_size"] = int(getattr(getattr(solver, "cfg", None), "pointworld_window_size", 0) or 0)
+                tb["chunk_stride"] = int(getattr(solver, "last_pw_chunk_stride", 0) or 0)
+                tb["chunk_count"] = int(getattr(solver, "last_pw_chunk_count", 0) or 0)
+                tb["last_chunk_valid_steps"] = int(getattr(solver, "last_pw_last_chunk_valid_steps", 0) or 0)
+                tb["chunk_mode"] = str(getattr(solver, "last_pw_chunk_mode", "") or "")
                 curobo_eval_ranges = getattr(solver, "last_curobo_eval_ranges", ())
                 if curobo_eval_ranges:
                     tb["curobo_eval_ranges"] = [dict(x) for x in tuple(curobo_eval_ranges)]
@@ -1637,7 +1684,10 @@ async def serve(cfg: ServerConfig) -> None:
     if verbose:
         pw_enabled = bool(pw is not None and bool(getattr(pw, "enabled", False)))
         dump_dir = os.getenv("MPPI_PW_ACCEPTANCE_DUMP_DIR", "").strip()
-        print(f"[pcl_server] boot host={cfg.host} port={cfg.port} policy={cfg.policy} horizon={cfg.open_loop_horizon} cam_id={cfg.cam_id}")
+        Tw = _env_i("MPPI_PW_WINDOW_SIZE", str(POINTWORLD_WINDOW_LEN))
+        stride = max(1, int(Tw - 1))
+        cc = int((max(0, int(cfg.open_loop_horizon)) + stride - 1) // stride) if int(cfg.open_loop_horizon) > 0 else 0
+        print(f"[pcl_server] boot host={cfg.host} port={cfg.port} policy={cfg.policy} horizon={cfg.open_loop_horizon} Tw={int(Tw)} chunk_stride={int(stride)} chunk_count={int(cc)} cam_id={cfg.cam_id}")
         print(f"[pcl_server] required_cams={list(REQUIRED_CAM_IDS)} loaded_cam_configs={sorted(cam_configs.keys())}")
         print(f"[pcl_server] needs_camera_decode={needs_camera_configs} cuda_available={_cuda_runtime_available()} default_num_samples={_default_num_samples()}")
         print(f"[pcl_server] curobo_device={os.getenv('MPPI_CUROBO_DEVICE', 'cuda:0')}")

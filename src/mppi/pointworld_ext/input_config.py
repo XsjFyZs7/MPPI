@@ -5,6 +5,8 @@ from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
+from mppi.pointworld_ext.tracker_interface import POINTWORLD_WINDOW_LEN
+
 
 Vec3 = Tuple[float, float, float]
 
@@ -136,8 +138,8 @@ class PointWorldInputConfig:
     def __post_init__(self) -> None:
         if int(self.window_size) < 1:
             raise ValueError("window_size must be >= 1")
-        if int(self.window_size) != 11:
-            raise ValueError("PointWorld requires window_size == 11")
+        if int(self.window_size) != int(POINTWORLD_WINDOW_LEN):
+            raise ValueError(f"PointWorld requires window_size == {int(POINTWORLD_WINDOW_LEN)}, got {int(self.window_size)}")
         if int(self.min_cameras) < 1:
             raise ValueError("min_cameras must be >= 1")
 

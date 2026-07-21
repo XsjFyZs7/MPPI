@@ -7,6 +7,7 @@ from typing import Deque, Dict, Optional, Tuple
 import numpy as np
 
 from mppi.pointworld_ext.geometry import PinholeIntrinsics
+from mppi.pointworld_ext.tracker_interface import POINTWORLD_WINDOW_LEN
 
 
 @dataclass(frozen=True)
@@ -29,8 +30,8 @@ class PointWorldWindowBuffer:
     def __init__(self, *, window_size: int) -> None:
         if int(window_size) < 1:
             raise ValueError("window_size must be >= 1")
-        if int(window_size) != 11:
-            raise ValueError("PointWorld requires window_size == 11")
+        if int(window_size) != int(POINTWORLD_WINDOW_LEN):
+            raise ValueError(f"PointWorld requires window_size == {int(POINTWORLD_WINDOW_LEN)}, got {int(window_size)}")
         self.window_size = int(window_size)
         self._steps: Deque[WindowStep] = deque(maxlen=self.window_size)
 

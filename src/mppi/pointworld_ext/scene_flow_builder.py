@@ -389,8 +389,10 @@ class OnlineSceneFlowBuilder:
         t_build0 = time.perf_counter()
         steps = self.window_buffer.get_window()
         T = len(steps)
-        if int(T) != 11:
-            raise RuntimeError("PointWorld requires window length T == 11")
+        from mppi.pointworld_ext.tracker_interface import POINTWORLD_WINDOW_LEN
+
+        if int(T) != int(POINTWORLD_WINDOW_LEN):
+            raise RuntimeError(f"PointWorld requires window length T == {int(POINTWORLD_WINDOW_LEN)}, got {int(T)}")
 
         available = self.window_buffer.get_available_cameras()
         cameras_used = self.cfg.select_cameras(available)
