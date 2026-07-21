@@ -1496,12 +1496,12 @@ async def _handle_connection(
                         pw_cost_debug["timing"] = dict(timing)
 
                 if pw_cost_error:
-                    tb = str(pw_cost_error.get("traceback", "") or "")
-                    if len(tb) > 4000:
-                        tb = tb[-4000:]
+                    traceback_str = str(pw_cost_error.get("traceback", "") or "")
+                    if len(traceback_str) > 4000:
+                        traceback_str = traceback_str[-4000:]
                     pw_cost_debug["error_type"] = str(pw_cost_error.get("type", "") or "")
                     pw_cost_debug["error_message"] = str(pw_cost_error.get("message", "") or "")
-                    pw_cost_debug["error_traceback"] = tb
+                    pw_cost_debug["error_traceback"] = traceback_str
 
                 tb["pw_ms"] = float(pw_cost_debug.get("ms", 0.0) or 0.0)
                 tb["actions_finite"] = bool(pw_cost_debug.get("actions_finite", True))

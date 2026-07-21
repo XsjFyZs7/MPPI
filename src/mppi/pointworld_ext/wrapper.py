@@ -697,11 +697,26 @@ class PointWorldCostModel:
 
         rep_timings: list[dict[str, Any]] = []
 
+        def _slice_obs(obs: dict[str, Any], *, start: int, end: int, total: int) -> dict[str, Any]:
+            out = dict(obs)
+            for k in ("scene_flows", "scene_colors", "scene_exists", "scene_track_confidence"):
+                v = obs.get(k, None)
+                if v is None:
+                    continue
+                try:
+                    a = np.asarray(v)
+                except Exception:
+                    continue
+                if a.ndim >= 1 and int(a.shape[0]) == int(total):
+                    out[k] = a[int(start) : int(end)]
+            return out
+
         def _worker(replica: _PointWorldReplica, start: int, end: int) -> tuple[int, int, np.ndarray, np.ndarray, dict[str, Any]]:
+            obs_i = _slice_obs(pointworld_obs, start=int(start), end=int(end), total=int(B))
             c, p0, t = self._evaluate_chunk_on_replica(
                 replica=replica,
                 q_traj=q[start:end],
-                pointworld_obs=pointworld_obs,
+                pointworld_obs=obs_i,
                 gripper=gripper,
                 valid_pred_steps=int(valid_pred_steps),
             )
@@ -785,11 +800,26 @@ class PointWorldCostModel:
         ranges = self._make_ranges(B, len(self._replicas))
         costs = np.zeros((B,), dtype=np.float32)
 
+        def _slice_obs(obs: dict[str, Any], *, start: int, end: int, total: int) -> dict[str, Any]:
+            out = dict(obs)
+            for k in ("scene_flows", "scene_colors", "scene_exists", "scene_track_confidence"):
+                v = obs.get(k, None)
+                if v is None:
+                    continue
+                try:
+                    a = np.asarray(v)
+                except Exception:
+                    continue
+                if a.ndim >= 1 and int(a.shape[0]) == int(total):
+                    out[k] = a[int(start) : int(end)]
+            return out
+
         def _worker(replica: _PointWorldReplica, start: int, end: int) -> tuple[int, int, np.ndarray, dict[str, Any]]:
+            obs_i = _slice_obs(pointworld_obs, start=int(start), end=int(end), total=int(B))
             result = self._evaluate_cost_on_replica(
                 replica=replica,
                 q_traj=q[start:end],
-                pointworld_obs=pointworld_obs,
+                pointworld_obs=obs_i,
                 gripper=gripper,
             )
             if isinstance(result, tuple) and len(result) == 2:

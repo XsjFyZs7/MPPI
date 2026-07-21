@@ -7,7 +7,7 @@ python3 /home/wangyuhan/MPPI/tests/pw_replay_acceptance.py \
   --primary-cam-id back \
   --dual-view \
   --start-idx 0 \
-  --max-steps 60 \
+  --max-steps 30 \
   --sleep-s 0.0 \
   --gripper 0.0 \
   --depth-unit-scale 1.0 \
